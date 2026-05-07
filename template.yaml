@@ -1,0 +1,205 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: SiteSpy backend — Phase 0 (ingest path, data plane, credential store)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Parameters
+# ─────────────────────────────────────────────────────────────────────────────
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [dev, prod]
+    Default: dev
+    Description: Deployment environment. Drives naming and some defaults.
+
+  LogLevel:
+    Type: String
+    AllowedValues: [DEBUG, INFO, WARNING, ERROR]
+    Default: INFO
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Globals
+# ─────────────────────────────────────────────────────────────────────────────
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 30
+    MemorySize: 512
+    Architectures: [arm64]
+    Tracing: Active
+    Environment:
+      Variables:
+        POWERTOOLS_SERVICE_NAME: sitespy
+        POWERTOOLS_METRICS_NAMESPACE: SiteSpy
+        LOG_LEVEL: !Ref LogLevel
+        ENVIRONMENT: !Ref Environment
+        SNAPSHOTS_BUCKET: !Ref SnapshotsBucket
+        DATA_TABLE: !Ref DataTable
+        CAMERA_SECRETS_PREFIX: !Sub sitespy/${Environment}/cameras
+    Tags:
+      Project: SiteSpy
+      Environment: !Ref Environment
+
+  Api:
+    TracingEnabled: true
+    OpenApiVersion: 3.0.1
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Resources
+# ─────────────────────────────────────────────────────────────────────────────
+Resources:
+
+  # ── S3: snapshot storage ──────────────────────────────────────────────────
+  SnapshotsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub sitespy-${Environment}-snapshots-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToGlacierAfter1Year
+            Status: Enabled
+            Transitions:
+              - StorageClass: GLACIER_IR
+                TransitionInDays: 365
+          - Id: ExpireIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins: ["*"]
+            AllowedMethods: [GET]
+            AllowedHeaders: ["*"]
+            MaxAge: 300
+
+  # ── DynamoDB: single-table design ─────────────────────────────────────────
+  # PK / SK schema documented in requirements/multi-tenant-auth.md §3 and
+  # requirements/api_contract.md (Flagged Cameras + image records).
+  DataTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub sitespy-${Environment}-data
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+        - AttributeName: GSI1PK
+          AttributeType: S
+        - AttributeName: GSI1SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - AttributeName: GSI1PK
+              KeyType: HASH
+            - AttributeName: GSI1SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      Tags:
+        - Key: Project
+          Value: SiteSpy
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── API Gateway: REST API with /v1/ prefix ────────────────────────────────
+  SiteSpyApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub sitespy-${Environment}
+      StageName: prod
+      EndpointConfiguration:
+        Type: REGIONAL
+      BinaryMediaTypes:
+        - image/jpeg
+        - image/png
+        - "*/*"
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          LoggingLevel: INFO
+          DataTraceEnabled: false
+          MetricsEnabled: true
+
+  # ── Ingest Lambda ─────────────────────────────────────────────────────────
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub sitespy-${Environment}-ingest
+      CodeUri: src/
+      Handler: sitespy.handlers.ingest.handler
+      Description: Receives JPEG snapshots from Axis cameras over HTTP Basic Auth.
+      Timeout: 30
+      MemorySize: 1024
+      Policies:
+        - S3WritePolicy:
+            BucketName: !Ref SnapshotsBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DataTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource:
+                - !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:sitespy/${Environment}/cameras/*
+      Events:
+        IngestPost:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SiteSpyApi
+            Path: /v1/ingest
+            Method: POST
+            Auth:
+              # Basic Auth is validated inside the Lambda, not at API Gateway.
+              # Gateway sees the request as authenticated-by-lambda.
+              Authorizer: NONE
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Outputs
+# ─────────────────────────────────────────────────────────────────────────────
+Outputs:
+  ApiEndpoint:
+    Description: Base URL for the SiteSpy API (append /v1/... for routes).
+    Value: !Sub https://${SiteSpyApi}.execute-api.${AWS::Region}.amazonaws.com/prod
+    Export:
+      Name: !Sub sitespy-${Environment}-api-endpoint
+
+  IngestUrl:
+    Description: Full ingest URL — paste into Axis VAPIX recipient config.
+    Value: !Sub https://${SiteSpyApi}.execute-api.${AWS::Region}.amazonaws.com/prod/v1/ingest
+
+  SnapshotsBucketName:
+    Value: !Ref SnapshotsBucket
+    Export:
+      Name: !Sub sitespy-${Environment}-snapshots-bucket
+
+  DataTableName:
+    Value: !Ref DataTable
+    Export:
+      Name: !Sub sitespy-${Environment}-data-table

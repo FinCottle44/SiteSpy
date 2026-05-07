@@ -1,0 +1,48 @@
+version = 0.1
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dev — consultancy account, eu-west-2
+# ─────────────────────────────────────────────────────────────────────────────
+[dev.global.parameters]
+stack_name = "sitespy-dev"
+
+[dev.build.parameters]
+cached = true
+parallel = true
+
+[dev.deploy.parameters]
+region = "eu-west-2"
+profile = "sitespy-dev"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+resolve_s3 = true
+fail_on_empty_changeset = false
+parameter_overrides = "Environment=dev LogLevel=INFO"
+tags = "Project=SiteSpy Environment=dev"
+
+[dev.sync.parameters]
+watch = false
+
+[dev.local_start_api.parameters]
+warm_containers = "EAGER"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Prod — same account for now, separate stack. Swap profile when moving to the
+# business AWS account. See requirements/software_logic.md §13.1.1.
+# ─────────────────────────────────────────────────────────────────────────────
+[prod.global.parameters]
+stack_name = "sitespy-prod"
+
+[prod.build.parameters]
+cached = true
+parallel = true
+
+[prod.deploy.parameters]
+region = "eu-west-2"
+profile = "sitespy-dev"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+resolve_s3 = true
+fail_on_empty_changeset = false
+parameter_overrides = "Environment=prod LogLevel=INFO"
+tags = "Project=SiteSpy Environment=prod"

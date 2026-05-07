@@ -1,0 +1,96 @@
+# ==============================================================================
+# SiteSpy .gitignore
+# ==============================================================================
+
+# ── OS / editor ─────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+!.vscode/launch.json
+.kiro/user-settings/
+*~
+
+# ── Secrets & local config ──────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+credentials
+aws-credentials*
+
+# ── Local dev artifacts ─────────────────────────────────────────────────────
+images/
+*.log
+logs/
+
+# ── Confidential documents ──────────────────────────────────────────────────
+# PDFs and internal hardware specs — opt-in individually if you want one tracked.
+*.pdf
+
+# ── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.egg-info/
+dist/
+build/
+
+# ── Node / Frontend ─────────────────────────────────────────────────────────
+node_modules/
+.pnpm-store/
+.yarn/
+.npm/
+*.tsbuildinfo
+.next/
+.nuxt/
+out/
+.turbo/
+.parcel-cache/
+
+# Vite
+dist-ssr/
+*.local
+
+# ── AWS SAM ─────────────────────────────────────────────────────────────────
+.aws-sam/
+samconfig.local.toml
+packaged.yaml
+
+# ── CDK (in case we add it later) ───────────────────────────────────────────
+cdk.out/
+cdk.context.json
+
+# ── Terraform (in case we add it later) ─────────────────────────────────────
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+
+# ── LocalStack (integration tests) ──────────────────────────────────────────
+.localstack/
+volume/
+
+# ── Test output ─────────────────────────────────────────────────────────────
+test-results/
+playwright-report/
+playwright/.cache/

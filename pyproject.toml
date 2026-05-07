@@ -1,0 +1,53 @@
+[project]
+name = "sitespy"
+version = "0.0.1"
+description = "SiteSpy — multi-tenant construction progress monitoring backend"
+requires-python = ">=3.12,<3.13"
+license = { text = "Proprietary" }
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "UP",  # pyupgrade
+    "N",   # pep8-naming
+    "SIM", # flake8-simplify
+    "RUF", # ruff-specific
+]
+ignore = [
+    "E501", # line length — trust the formatter
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["N802", "N803"]  # allow snake_case in test fixtures
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+
+[[tool.mypy.overrides]]
+module = ["moto.*", "boto3.*", "botocore.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "tests"]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "integration: marks tests that hit LocalStack or real AWS (deselect with -m 'not integration')",
+]

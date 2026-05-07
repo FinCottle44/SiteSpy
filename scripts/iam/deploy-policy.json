@@ -1,0 +1,195 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "CloudFormationSAMDeploy",
+      "Effect": "Allow",
+      "Action": [
+        "cloudformation:*"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "S3BucketsForArtifactsAndSnapshots",
+      "Effect": "Allow",
+      "Action": [
+        "s3:*"
+      ],
+      "Resource": [
+        "arn:aws:s3:::sitespy-*",
+        "arn:aws:s3:::sitespy-*/*",
+        "arn:aws:s3:::aws-sam-cli-managed-*",
+        "arn:aws:s3:::aws-sam-cli-managed-*/*"
+      ]
+    },
+    {
+      "Sid": "S3ListForArtifactBucketDiscovery",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListAllMyBuckets",
+        "s3:GetBucketLocation"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "LambdaFull",
+      "Effect": "Allow",
+      "Action": [
+        "lambda:*"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ApiGatewayFull",
+      "Effect": "Allow",
+      "Action": [
+        "apigateway:*"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "DynamoDBFull",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:*"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "CognitoFull",
+      "Effect": "Allow",
+      "Action": [
+        "cognito-idp:*",
+        "cognito-identity:*"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "SecretsManagerForAppSecrets",
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:*"
+      ],
+      "Resource": [
+        "arn:aws:secretsmanager:*:*:secret:sitespy/*",
+        "arn:aws:secretsmanager:*:*:secret:slack/*"
+      ]
+    },
+    {
+      "Sid": "EventBridgeScheduledRules",
+      "Effect": "Allow",
+      "Action": [
+        "events:*",
+        "scheduler:*"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "CloudWatchLogsMetricsAlarmsDashboards",
+      "Effect": "Allow",
+      "Action": [
+        "logs:*",
+        "cloudwatch:*"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "XRayTracing",
+      "Effect": "Allow",
+      "Action": [
+        "xray:*"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "SESForInvitesAndReports",
+      "Effect": "Allow",
+      "Action": [
+        "ses:*"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "SNSForAlarmNotifications",
+      "Effect": "Allow",
+      "Action": [
+        "sns:*"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "Route53ForCustomDomain",
+      "Effect": "Allow",
+      "Action": [
+        "route53:*"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ACMForTLSCerts",
+      "Effect": "Allow",
+      "Action": [
+        "acm:*"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AmplifyForFrontendHosting",
+      "Effect": "Allow",
+      "Action": [
+        "amplify:*"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "IAMScopedToSiteSpyOnly",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateRole",
+        "iam:DeleteRole",
+        "iam:GetRole",
+        "iam:PassRole",
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy",
+        "iam:PutRolePolicy",
+        "iam:DeleteRolePolicy",
+        "iam:GetRolePolicy",
+        "iam:ListRolePolicies",
+        "iam:ListAttachedRolePolicies",
+        "iam:TagRole",
+        "iam:UntagRole",
+        "iam:UpdateAssumeRolePolicy",
+        "iam:CreateServiceLinkedRole",
+        "iam:CreatePolicy",
+        "iam:DeletePolicy",
+        "iam:GetPolicy",
+        "iam:GetPolicyVersion",
+        "iam:ListPolicyVersions",
+        "iam:CreatePolicyVersion",
+        "iam:DeletePolicyVersion"
+      ],
+      "Resource": [
+        "arn:aws:iam::*:role/sitespy-*",
+        "arn:aws:iam::*:policy/sitespy-*"
+      ]
+    },
+    {
+      "Sid": "IAMReadOnlyForSamDiscovery",
+      "Effect": "Allow",
+      "Action": [
+        "iam:ListRoles",
+        "iam:ListPolicies",
+        "iam:GetAccountAuthorizationDetails"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "STSWhoAmI",
+      "Effect": "Allow",
+      "Action": [
+        "sts:GetCallerIdentity"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
