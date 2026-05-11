@@ -65,6 +65,7 @@ node_modules/
 out/
 .turbo/
 .parcel-cache/
+.hypothesis/
 
 # Vite
 dist-ssr/

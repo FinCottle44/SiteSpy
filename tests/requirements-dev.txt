@@ -1,0 +1,6 @@
+hypothesis==6.122.3
+moto[s3,dynamodb]==5.0.27
+pytest==8.3.5
+pytest-mock==3.14.0
+aws-lambda-powertools[tracer]==3.29.0
+bcrypt==4.2.1

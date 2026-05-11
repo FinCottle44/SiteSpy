@@ -17,6 +17,16 @@ Parameters:
     AllowedValues: [DEBUG, INFO, WARNING, ERROR]
     Default: INFO
 
+  CognitoUserPoolId:
+    Type: String
+    Description: Cognito User Pool ID for dashboard authentication.
+    Default: ""
+
+  CognitoUserPoolClientId:
+    Type: String
+    Description: Cognito User Pool App Client ID for dashboard authentication.
+    Default: ""
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Globals
 # ─────────────────────────────────────────────────────────────────────────────
@@ -26,7 +36,6 @@ Globals:
     Timeout: 30
     MemorySize: 512
     Architectures: [arm64]
-    Tracing: Active
     Environment:
       Variables:
         POWERTOOLS_SERVICE_NAME: sitespy
@@ -35,13 +44,11 @@ Globals:
         ENVIRONMENT: !Ref Environment
         SNAPSHOTS_BUCKET: !Ref SnapshotsBucket
         DATA_TABLE: !Ref DataTable
-        CAMERA_SECRETS_PREFIX: !Sub sitespy/${Environment}/cameras
     Tags:
       Project: SiteSpy
       Environment: !Ref Environment
 
   Api:
-    TracingEnabled: true
     OpenApiVersion: 3.0.1
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -50,10 +57,12 @@ Globals:
 Resources:
 
   # ── S3: snapshot storage ──────────────────────────────────────────────────
+  # TODO(prod): Change DeletionPolicy and UpdateReplacePolicy back to Retain
+  # on both SnapshotsBucket and DataTable before deploying to production.
   SnapshotsBucket:
     Type: AWS::S3::Bucket
-    DeletionPolicy: Retain
-    UpdateReplacePolicy: Retain
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
     Properties:
       BucketName: !Sub sitespy-${Environment}-snapshots-${AWS::AccountId}
       PublicAccessBlockConfiguration:
@@ -90,8 +99,8 @@ Resources:
   # requirements/api_contract.md (Flagged Cameras + image records).
   DataTable:
     Type: AWS::DynamoDB::Table
-    DeletionPolicy: Retain
-    UpdateReplacePolicy: Retain
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
     Properties:
       TableName: !Sub sitespy-${Environment}-data
       BillingMode: PAY_PER_REQUEST
@@ -139,13 +148,201 @@ Resources:
       BinaryMediaTypes:
         - image/jpeg
         - image/png
-        - "*/*"
       MethodSettings:
         - ResourcePath: "/*"
           HttpMethod: "*"
           LoggingLevel: INFO
           DataTraceEnabled: false
           MetricsEnabled: true
+      Cors:
+        AllowMethods: "'GET,POST,PATCH,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization,X-Correlation-Id'"
+        AllowOrigin: "'*'"
+      GatewayResponses:
+        DEFAULT_4XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: "'*'"
+              Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Correlation-Id'"
+              Access-Control-Allow-Methods: "'GET,POST,PATCH,OPTIONS'"
+        DEFAULT_5XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: "'*'"
+              Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Correlation-Id'"
+              Access-Control-Allow-Methods: "'GET,POST,PATCH,OPTIONS'"
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        AddDefaultAuthorizerToCorsPreflight: false
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !Sub "arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${CognitoUserPoolId}"
+            Identity:
+              Header: Authorization
+
+  # ── Tenants Lambda ─────────────────────────────────────────────────────────
+  TenantsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub sitespy-${Environment}-tenants
+      CodeUri: src/
+      Handler: sitespy.handlers.tenants.handler
+      Description: Lists all tenants (super admin only).
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref DataTable
+      Events:
+        GetTenants:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SiteSpyApi
+            Path: /v1/tenants
+            Method: GET
+
+  # ── Sites List Lambda ─────────────────────────────────────────────────────
+  SitesListFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub sitespy-${Environment}-sites-list
+      CodeUri: src/
+      Handler: sitespy.handlers.sites.handler_list
+      Description: Returns all sites accessible to the caller.
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref DataTable
+      Events:
+        GetSites:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SiteSpyApi
+            Path: /v1/sites
+            Method: GET
+
+  # ── Sites Lambda ──────────────────────────────────────────────────────────
+  SitesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub sitespy-${Environment}-sites
+      CodeUri: src/
+      Handler: sitespy.handlers.sites.handler
+      Description: Returns site metadata and camera list for the dashboard.
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref DataTable
+      Events:
+        GetSite:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SiteSpyApi
+            Path: /v1/sites/{site_id}
+            Method: GET
+
+  # ── Snapshots Latest Lambda ───────────────────────────────────────────────
+  SnapshotsLatestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub sitespy-${Environment}-snapshots-latest
+      CodeUri: src/
+      Handler: sitespy.handlers.snapshots.handler_latest
+      Description: Returns the latest snapshot for each camera in a site.
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref DataTable
+        - Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub "arn:aws:s3:::${SnapshotsBucket}/*"
+      Events:
+        GetSnapshotsLatest:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SiteSpyApi
+            Path: /v1/snapshots/latest
+            Method: GET
+
+  # ── Snapshots List Lambda ─────────────────────────────────────────────────
+  SnapshotsListFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub sitespy-${Environment}-snapshots-list
+      CodeUri: src/
+      Handler: sitespy.handlers.snapshots.handler_list
+      Description: Returns a paginated list of snapshots for a camera.
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref DataTable
+        - Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub "arn:aws:s3:::${SnapshotsBucket}/*"
+      Events:
+        GetSnapshotsList:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SiteSpyApi
+            Path: /v1/snapshots
+            Method: GET
+
+  # ── Flags POST Lambda ─────────────────────────────────────────────────────
+  FlagsPostFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub sitespy-${Environment}-flags-post
+      CodeUri: src/
+      Handler: sitespy.handlers.flags.handler_post
+      Description: Raises a new flag on a camera.
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DataTable
+      Events:
+        PostFlag:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SiteSpyApi
+            Path: /v1/flags
+            Method: POST
+
+  # ── Flags GET Lambda ──────────────────────────────────────────────────────
+  FlagsGetFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub sitespy-${Environment}-flags-get
+      CodeUri: src/
+      Handler: sitespy.handlers.flags.handler_get
+      Description: Lists flags scoped by caller role.
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref DataTable
+        - Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub "arn:aws:s3:::${SnapshotsBucket}/*"
+      Events:
+        GetFlags:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SiteSpyApi
+            Path: /v1/flags
+            Method: GET
+
+  # ── Flags PATCH Lambda ────────────────────────────────────────────────────
+  FlagsPatchFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub sitespy-${Environment}-flags-patch
+      CodeUri: src/
+      Handler: sitespy.handlers.flags.handler_patch
+      Description: Updates a flag status (acknowledge, resolve, dismiss).
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DataTable
+      Events:
+        PatchFlag:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SiteSpyApi
+            Path: /v1/flags/{flag_id}
+            Method: PATCH
 
   # ── Ingest Lambda ─────────────────────────────────────────────────────────
   IngestFunction:
@@ -158,27 +355,24 @@ Resources:
       Timeout: 30
       MemorySize: 1024
       Policies:
-        - S3WritePolicy:
-            BucketName: !Ref SnapshotsBucket
-        - DynamoDBCrudPolicy:
-            TableName: !Ref DataTable
         - Statement:
             - Effect: Allow
               Action:
-                - secretsmanager:GetSecretValue
-              Resource:
-                - !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:sitespy/${Environment}/cameras/*
+                - s3:PutObject
+                - s3:PutObjectTagging
+              Resource: !Sub "arn:aws:s3:::${SnapshotsBucket}/*"
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DataTable
       Events:
         IngestPost:
           Type: Api
           Properties:
             RestApiId: !Ref SiteSpyApi
-            Path: /v1/ingest
+            Path: /v1/ingest/{token}
             Method: POST
             Auth:
-              # Basic Auth is validated inside the Lambda, not at API Gateway.
-              # Gateway sees the request as authenticated-by-lambda.
               Authorizer: NONE
+            # No API Gateway authorizer — token auth is validated inside the Lambda.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Outputs
@@ -191,8 +385,8 @@ Outputs:
       Name: !Sub sitespy-${Environment}-api-endpoint
 
   IngestUrl:
-    Description: Full ingest URL — paste into Axis VAPIX recipient config.
-    Value: !Sub https://${SiteSpyApi}.execute-api.${AWS::Region}.amazonaws.com/prod/v1/ingest
+    Description: Ingest URL template — replace {token} with the camera's ingest token.
+    Value: !Sub https://${SiteSpyApi}.execute-api.${AWS::Region}.amazonaws.com/prod/v1/ingest/{token}
 
   SnapshotsBucketName:
     Value: !Ref SnapshotsBucket
@@ -203,3 +397,15 @@ Outputs:
     Value: !Ref DataTable
     Export:
       Name: !Sub sitespy-${Environment}-data-table
+
+  CognitoUserPoolId:
+    Description: Cognito User Pool ID used for dashboard authentication.
+    Value: !Ref CognitoUserPoolId
+    Export:
+      Name: !Sub sitespy-${Environment}-cognito-user-pool-id
+
+  CognitoUserPoolClientId:
+    Description: Cognito User Pool App Client ID used for dashboard authentication.
+    Value: !Ref CognitoUserPoolClientId
+    Export:
+      Name: !Sub sitespy-${Environment}-cognito-user-pool-client-id

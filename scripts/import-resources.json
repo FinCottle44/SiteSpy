@@ -1,0 +1,16 @@
+[
+  {
+    "ResourceType": "AWS::S3::Bucket",
+    "LogicalResourceId": "SnapshotsBucket",
+    "ResourceIdentifier": {
+      "BucketName": "sitespy-dev-snapshots-378202224921"
+    }
+  },
+  {
+    "ResourceType": "AWS::DynamoDB::Table",
+    "LogicalResourceId": "DataTable",
+    "ResourceIdentifier": {
+      "TableName": "sitespy-dev-data"
+    }
+  }
+]

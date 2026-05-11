@@ -23,10 +23,12 @@ select = [
 ]
 ignore = [
     "E501", # line length — trust the formatter
+    "N818", # exception names don't need Error suffix (BadRequest, Unauthorized are intentional)
+    "RUF002", # EN dash in docstrings is intentional for requirement ranges
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["N802", "N803"]  # allow snake_case in test fixtures
+"tests/*" = ["N802", "N803", "E402"]  # allow snake_case in test fixtures, imports inside functions
 
 [tool.ruff.format]
 quote-style = "double"
