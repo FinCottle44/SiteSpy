@@ -18,7 +18,6 @@ import json
 import os
 from unittest.mock import patch
 
-import bcrypt
 import boto3
 from botocore.exceptions import ClientError
 from moto import mock_aws
@@ -89,15 +88,17 @@ def _setup_aws():
     return s3, ddb
 
 
-def _seed_camera(ddb, tenant_id, site_id, camera_id, username, password, cost=12):
-    hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt(rounds=cost))
+def _seed_camera(ddb, tenant_id, site_id, camera_id, ingest_token):
+    """Seed a camera with token-based auth."""
     ddb.put_item(
         TableName="test-data-table",
         Item={
             "PK": {"S": f"TENANT#{tenant_id}"},
             "SK": {"S": f"SITE#{site_id}#CAM#{camera_id}"},
-            "ingest_username": {"S": username},
-            "ingest_password_hash": {"S": hashed.decode()},
+            "GSI1PK": {"S": f"TOKEN#{ingest_token}"},
+            "GSI1SK": {"S": "CAMERA"},
+            "camera_name": {"S": "Test Camera"},
+            "ingest_token": {"S": ingest_token},
         },
     )
     ddb.put_item(
@@ -111,42 +112,27 @@ def _seed_camera(ddb, tenant_id, site_id, camera_id, username, password, cost=12
 
 
 def _make_event(
-    tenant_id="acme",
-    site_id="site_01",
-    camera_id="cam_01",
-    username="sitespy_cam_test",
-    password="testpass",
+    token="tk_validtoken1234567890abcdefghijklmnopqr",
     body=None,
-    content_type="image/jpeg",
     correlation_id="test-corr-id",
-    omit_tenant=False,
-    omit_site=False,
-    omit_camera=False,
-    omit_auth=False,
+    omit_token=False,
+    invalid_token=False,
 ):
+    """Build an ingest event using token-based URL path auth."""
     if body is None:
         body = b"\xff\xd8\xff\xe0" + b"\x00" * 100
-    credentials = base64.b64encode(f"{username}:{password}".encode()).decode()
-    headers = {
-        "Content-Type": content_type,
-        "X-Correlation-Id": correlation_id,
-    }
-    if not omit_auth:
-        headers["Authorization"] = f"Basic {credentials}"
-    if not omit_tenant:
-        headers["X-Tenant-ID"] = tenant_id
-    if not omit_site:
-        headers["X-Site-ID"] = site_id
 
-    qs = {}
-    if not omit_camera:
-        qs["cameraID"] = camera_id
+    path_token = "" if omit_token else ("bad!" if invalid_token else token)
 
     return {
         "httpMethod": "POST",
-        "path": "/v1/ingest",
-        "headers": headers,
-        "queryStringParameters": qs,
+        "path": f"/v1/ingest/{path_token}",
+        "pathParameters": {"token": path_token} if not omit_token else {},
+        "headers": {
+            "Content-Type": "image/jpeg",
+            "X-Correlation-Id": correlation_id,
+        },
+        "queryStringParameters": None,
         "body": base64.b64encode(body).decode(),
         "isBase64Encoded": True,
     }
@@ -186,43 +172,13 @@ def _assert_error_envelope(result, expected_status=None):
 # ---------------------------------------------------------------------------
 
 
-def test_p6_missing_tenant_id():
-    _set_env()
-    with mock_aws():
-        _setup_aws()
-        result = _invoke(_make_event(omit_tenant=True))
-    _assert_error_envelope(result, 400)
-
-
-def test_p6_missing_site_id():
-    _set_env()
-    with mock_aws():
-        _setup_aws()
-        result = _invoke(_make_event(omit_site=True))
-    _assert_error_envelope(result, 400)
-
-
-def test_p6_missing_camera_id():
-    _set_env()
-    with mock_aws():
-        _setup_aws()
-        result = _invoke(_make_event(omit_camera=True))
-    _assert_error_envelope(result, 400)
-
-
-def test_p6_invalid_tenant_id_regex():
-    _set_env()
-    with mock_aws():
-        _setup_aws()
-        result = _invoke(_make_event(tenant_id="INVALID-UPPER"))
-    _assert_error_envelope(result, 400)
-
-
 def test_p6_empty_body():
     _set_env()
     with mock_aws():
-        _setup_aws()
-        event = _make_event()
+        _s3, ddb = _setup_aws()
+        token = "tk_validtoken1234567890abcdefghijklmnopqr"
+        _seed_camera(ddb, "acme", "site_01", "cam_01", token)
+        event = _make_event(token=token)
         event["body"] = ""
         event["isBase64Encoded"] = False
         result = _invoke(event)
@@ -232,26 +188,22 @@ def test_p6_empty_body():
 def test_p6_bad_magic_bytes():
     _set_env()
     with mock_aws():
-        _setup_aws()
+        _s3, ddb = _setup_aws()
+        token = "tk_validtoken1234567890abcdefghijklmnopqr"
+        _seed_camera(ddb, "acme", "site_01", "cam_01", token)
         bad_body = b"\x00\x01\x02\x03" + b"\x00" * 100
-        result = _invoke(_make_event(body=bad_body))
+        result = _invoke(_make_event(token=token, body=bad_body))
     _assert_error_envelope(result, 400)
 
 
 def test_p6_body_too_large():
     _set_env()
     with mock_aws():
-        _setup_aws()
+        _s3, ddb = _setup_aws()
+        token = "tk_validtoken1234567890abcdefghijklmnopqr"
+        _seed_camera(ddb, "acme", "site_01", "cam_01", token)
         big_body = b"\xff\xd8\xff\xe0" + b"\x00" * (10 * 1024 * 1024 + 1)
-        result = _invoke(_make_event(body=big_body))
-    _assert_error_envelope(result, 400)
-
-
-def test_p6_wrong_content_type():
-    _set_env()
-    with mock_aws():
-        _setup_aws()
-        result = _invoke(_make_event(content_type="application/octet-stream"))
+        result = _invoke(_make_event(token=token, body=big_body))
     _assert_error_envelope(result, 400)
 
 
@@ -260,57 +212,29 @@ def test_p6_wrong_content_type():
 # ---------------------------------------------------------------------------
 
 
-def test_p6_missing_auth_header():
+def test_p6_missing_token():
     _set_env()
     with mock_aws():
         _setup_aws()
-        result = _invoke(_make_event(omit_auth=True))
+        event = _make_event(omit_token=True)
+        result = _invoke(event)
     _assert_error_envelope(result, 401)
 
 
-def test_p6_no_camera_item():
+def test_p6_invalid_token_format():
     _set_env()
     with mock_aws():
         _setup_aws()
-        # No camera row seeded → 401
-        result = _invoke(_make_event())
+        event = _make_event(invalid_token=True)
+        result = _invoke(event)
     _assert_error_envelope(result, 401)
 
 
-def test_p6_wrong_password():
+def test_p6_no_camera_for_token():
     _set_env()
     with mock_aws():
-        _s3, ddb = _setup_aws()
-        _seed_camera(ddb, "acme", "site_01", "cam_01", "sitespy_cam_test", "correctpass")
-        result = _invoke(_make_event(password="wrongpass"))
-    _assert_error_envelope(result, 401)
-
-
-def test_p6_hash_cost_too_low():
-    _set_env()
-    with mock_aws():
-        _s3, ddb = _setup_aws()
-        # Manually craft a cost-10 hash string to trigger the cost guard
-        real_hash = bcrypt.hashpw(b"testpass", bcrypt.gensalt(rounds=4)).decode()
-        # Replace cost digits with "10" to simulate a cost-10 hash
-        cost10_hash = real_hash[:4] + "10" + real_hash[6:]
-        ddb.put_item(
-            TableName="test-data-table",
-            Item={
-                "PK": {"S": "TENANT#acme"},
-                "SK": {"S": "SITE#site_01#CAM#cam_01"},
-                "ingest_username": {"S": "sitespy_cam_test"},
-                "ingest_password_hash": {"S": cost10_hash},
-            },
-        )
-        ddb.put_item(
-            TableName="test-data-table",
-            Item={
-                "PK": {"S": "TENANT#acme"},
-                "SK": {"S": "TENANT#acme"},
-                "retention_years": {"N": "5"},
-            },
-        )
+        _setup_aws()
+        # No camera seeded → token lookup returns None → 401
         result = _invoke(_make_event())
     _assert_error_envelope(result, 401)
 
@@ -324,7 +248,8 @@ def test_p6_s3_failure():
     _set_env()
     with mock_aws():
         _s3, ddb = _setup_aws()
-        _seed_camera(ddb, "acme", "site_01", "cam_01", "sitespy_cam_test", "testpass")
+        token = "tk_validtoken1234567890abcdefghijklmnopqr"
+        _seed_camera(ddb, "acme", "site_01", "cam_01", token)
 
         import sitespy.storage as storage_module
 
@@ -335,7 +260,7 @@ def test_p6_s3_failure():
             )
 
         with patch.object(storage_module, "put_snapshot", side_effect=fail_put):
-            result = _invoke(_make_event())
+            result = _invoke(_make_event(token=token))
     _assert_error_envelope(result, 500)
 
 
@@ -348,24 +273,23 @@ def test_p6_all_401_bodies_are_identical():
     """Every 401 cause returns a byte-identical response body."""
     _set_env()
     with mock_aws():
-        _s3, ddb = _setup_aws()
-        _seed_camera(ddb, "acme", "site_01", "cam_01", "sitespy_cam_test", "correctpass")
+        _setup_aws()
 
         # Collect 401 bodies from different causes
         bodies = []
 
-        # Missing auth header
-        r = _invoke(_make_event(omit_auth=True))
+        # Missing/empty token
+        r = _invoke(_make_event(omit_token=True))
         assert r["statusCode"] == 401
         bodies.append(r["body"])
 
-        # No camera item (different tenant)
-        r = _invoke(_make_event(tenant_id="other_tenant"))
+        # Invalid token format
+        r = _invoke(_make_event(invalid_token=True))
         assert r["statusCode"] == 401
         bodies.append(r["body"])
 
-        # Wrong password
-        r = _invoke(_make_event(password="wrongpass"))
+        # Valid format but no camera exists for this token
+        r = _invoke(_make_event())
         assert r["statusCode"] == 401
         bodies.append(r["body"])
 

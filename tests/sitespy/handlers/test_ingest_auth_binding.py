@@ -3,8 +3,10 @@
 Property 4: Authentication Binding
 Validates: Requirements 2.3, 3.2, 3.3
 
-For any ingest request, the single DynamoDB GetItem during authentication
-uses exactly Key = {"PK": "TENANT#"+t, "SK": "SITE#"+s+"#CAM#"+c}.
+For any ingest request, the token-based authentication resolves the camera
+via GSI1 lookup using exactly the token from the URL path. The resolved
+camera's tenant_id, site_id, and camera_id are used for all subsequent
+operations.
 """
 
 from __future__ import annotations
@@ -13,7 +15,6 @@ import base64
 import os
 from unittest.mock import patch
 
-import bcrypt
 import boto3
 from hypothesis import given, settings
 from hypothesis import strategies as st
@@ -24,6 +25,7 @@ from sitespy.handlers.ingest import _handle
 from sitespy.storage import _s3_client
 
 _ID_ST = st.from_regex(r"^[a-z0-9_]{1,64}$", fullmatch=True)
+_TOKEN_SUFFIX_ST = st.from_regex(r"^[A-Za-z0-9_-]{40}$", fullmatch=True)
 
 
 def _set_env():
@@ -82,15 +84,17 @@ def _setup_aws():
     return s3, ddb
 
 
-def _seed_camera(ddb, tenant_id, site_id, camera_id, username, password):
-    hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt(rounds=12))
+def _seed_camera(ddb, tenant_id, site_id, camera_id, ingest_token):
+    """Seed a camera record with token-based GSI1 index."""
     ddb.put_item(
         TableName="test-data-table",
         Item={
             "PK": {"S": f"TENANT#{tenant_id}"},
             "SK": {"S": f"SITE#{site_id}#CAM#{camera_id}"},
-            "ingest_username": {"S": username},
-            "ingest_password_hash": {"S": hashed.decode()},
+            "GSI1PK": {"S": f"TOKEN#{ingest_token}"},
+            "GSI1SK": {"S": "CAMERA"},
+            "camera_name": {"S": "Test Camera"},
+            "ingest_token": {"S": ingest_token},
         },
     )
     ddb.put_item(
@@ -103,20 +107,18 @@ def _seed_camera(ddb, tenant_id, site_id, camera_id, username, password):
     )
 
 
-def _make_event(tenant_id, site_id, camera_id, username, password, body=None):
+def _make_event(ingest_token, body=None):
+    """Build an ingest event using token-based URL path auth."""
     if body is None:
         body = b"\xff\xd8\xff\xe0" + b"\x00" * 100
-    credentials = base64.b64encode(f"{username}:{password}".encode()).decode()
     return {
         "httpMethod": "POST",
-        "path": "/v1/ingest",
+        "path": f"/v1/ingest/{ingest_token}",
+        "pathParameters": {"token": ingest_token},
         "headers": {
-            "Authorization": f"Basic {credentials}",
-            "X-Tenant-ID": tenant_id,
-            "X-Site-ID": site_id,
             "Content-Type": "image/jpeg",
         },
-        "queryStringParameters": {"cameraID": camera_id},
+        "queryStringParameters": None,
         "body": base64.b64encode(body).decode(),
         "isBase64Encoded": True,
     }
@@ -126,43 +128,40 @@ def _make_event(tenant_id, site_id, camera_id, username, password, body=None):
     tenant_id=_ID_ST,
     site_id=_ID_ST,
     camera_id=_ID_ST,
+    token_suffix=_TOKEN_SUFFIX_ST,
 )
 @settings(max_examples=20, deadline=None)
-def test_p4_auth_binding_get_item_key(tenant_id, site_id, camera_id):
-    """P4: the single GetItem during auth uses exactly the request's (t, s, c) triple."""
+def test_p4_auth_binding_get_camera_by_token(tenant_id, site_id, camera_id, token_suffix):
+    """P4: token-based auth resolves the camera via get_camera_by_token with the request token."""
     _set_env()
+
+    ingest_token = f"tk_{token_suffix}"
 
     with mock_aws():
         _s3, ddb = _setup_aws()
-        username = "sitespy_cam_bind"
-        password = "bindpassword"
-        _seed_camera(ddb, tenant_id, site_id, camera_id, username, password)
+        _seed_camera(ddb, tenant_id, site_id, camera_id, ingest_token)
 
-        event = _make_event(tenant_id, site_id, camera_id, username, password)
+        event = _make_event(ingest_token)
 
-        # Spy on the DynamoDB client's get_item calls
-        get_item_calls = []
-        original_get_camera = None
+        # Spy on get_camera_by_token calls
+        lookup_calls = []
 
         import sitespy.data as data_module
 
-        original_get_camera = data_module.get_camera
+        original_get_camera_by_token = data_module.get_camera_by_token
 
-        def spy_get_camera(t, s, c):
-            get_item_calls.append((t, s, c))
-            return original_get_camera(t, s, c)
+        def spy_get_camera_by_token(token):
+            lookup_calls.append(token)
+            return original_get_camera_by_token(token)
 
         import contextlib
 
         with (
-            patch.object(data_module, "get_camera", side_effect=spy_get_camera),
+            patch.object(data_module, "get_camera_by_token", side_effect=spy_get_camera_by_token),
             contextlib.suppress(Exception),
         ):
             _handle(event, "corr-p4")
 
-        # Exactly one get_camera call
-        assert len(get_item_calls) == 1
-        called_t, called_s, called_c = get_item_calls[0]
-        assert called_t == tenant_id
-        assert called_s == site_id
-        assert called_c == camera_id
+        # Exactly one get_camera_by_token call with the request's token
+        assert len(lookup_calls) == 1
+        assert lookup_calls[0] == ingest_token

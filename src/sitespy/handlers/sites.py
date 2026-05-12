@@ -201,6 +201,22 @@ def _handle(event: dict[str, Any], correlation_id: str) -> dict[str, Any]:
         "cameras": cameras,
     }
 
+    # Include ingest_hours if configured
+    ingest_hours_attr = site_item.get("ingest_hours")
+    if ingest_hours_attr is not None:
+        m = ingest_hours_attr.get("M")
+        if m:
+            start = m.get("start", {}).get("S")
+            end = m.get("end", {}).get("S")
+            if start and end:
+                body["ingest_hours"] = {"start": start, "end": end}
+            else:
+                body["ingest_hours"] = None
+        else:
+            body["ingest_hours"] = None
+    else:
+        body["ingest_hours"] = None
+
     return json_response(200, body, correlation_id)
 
 
@@ -445,13 +461,31 @@ def _handle_list(event: dict[str, Any], correlation_id: str) -> dict[str, Any]:
         if role == "user" and site_id not in site_access:
             continue
 
-        sites.append({
+        site_entry: dict[str, Any] = {
             "site_id": site_id,
             "site_name": item.get("site_name", {}).get("S", ""),
             "tenant_id": tenant_id,
             "latitude": _parse_float(item.get("latitude")),
             "longitude": _parse_float(item.get("longitude")),
             "timezone": item.get("timezone", {}).get("S", "Europe/London"),
-        })
+        }
+
+        # Include ingest_hours if configured
+        ingest_hours_attr = item.get("ingest_hours")
+        if ingest_hours_attr is not None:
+            m = ingest_hours_attr.get("M")
+            if m:
+                start = m.get("start", {}).get("S")
+                end = m.get("end", {}).get("S")
+                if start and end:
+                    site_entry["ingest_hours"] = {"start": start, "end": end}
+                else:
+                    site_entry["ingest_hours"] = None
+            else:
+                site_entry["ingest_hours"] = None
+        else:
+            site_entry["ingest_hours"] = None
+
+        sites.append(site_entry)
 
     return json_response(200, {"sites": sites}, correlation_id)

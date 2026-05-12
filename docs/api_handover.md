@@ -448,7 +448,7 @@ Exceeding limits returns `429` with a `Retry-After` header. Implement exponentia
 ## CORS
 
 The API allows:
-- Methods: `GET, POST, PATCH, OPTIONS`
+- Methods: `GET, POST, PATCH, DELETE, OPTIONS`
 - Headers: `Content-Type, Authorization, X-Correlation-Id`
 - Origin: `*` (any origin allowed)
 
@@ -495,15 +495,378 @@ export default api;
 
 ---
 
+## Admin Management Endpoints
+
+These endpoints handle provisioning of tenants, sites, cameras, and users. They require elevated roles (super admin or tenant admin).
+
+---
+
+### POST /v1/tenants
+
+Creates a new tenant. **Super admin only.**
+
+**Body:**
+```json
+{
+  "tenant_id": "acme_corp",
+  "tenant_name": "Acme Construction Ltd",
+  "primary_contact_email": "ops@acme.example.com",
+  "stale_threshold_hours": 24
+}
+```
+
+**Field rules:**
+- `tenant_id` — required, must match `^[a-z0-9_]{3,32}$`
+- `tenant_name` — required
+- `primary_contact_email` — required, must be a valid email
+- `stale_threshold_hours` — optional, integer in [1, 720], defaults to 24
+
+**Response (201):**
+```json
+{
+  "tenant_id": "acme_corp",
+  "tenant_name": "Acme Construction Ltd",
+  "primary_contact_email": "ops@acme.example.com",
+  "stale_threshold_hours": 24
+}
+```
+
+**Errors:**
+- 400 — invalid tenant_id format, missing required fields, stale_threshold_hours out of range
+- 403 — caller is not super_admin
+- 409 — tenant_id already exists
+
+---
+
+### POST /v1/sites
+
+Creates a new site within a tenant. **Super admin only.**
+
+**Query params:**
+- `tenant_id` (required) — the tenant to create the site under
+
+**Body:**
+```json
+{
+  "site_id": "site_001",
+  "site_name": "Acme Tower — Phase 2",
+  "latitude": 51.5074,
+  "longitude": -0.1278,
+  "timezone": "Europe/London"
+}
+```
+
+**Field rules:**
+- `site_id` — required, must match `^[a-z0-9_]{1,64}$`
+- `site_name` — required
+- `latitude` — required, float in [-90, 90]
+- `longitude` — required, float in [-180, 180]
+- `timezone` — optional, valid IANA timezone, defaults to `Europe/London`
+
+**Response (201):**
+```json
+{
+  "site_id": "site_001",
+  "site_name": "Acme Tower — Phase 2",
+  "tenant_id": "acme_corp",
+  "latitude": 51.5074,
+  "longitude": -0.1278,
+  "timezone": "Europe/London"
+}
+```
+
+**Errors:**
+- 400 — missing tenant_id query param, invalid site_id format, lat/lon out of range, invalid timezone
+- 403 — caller is not super_admin
+- 404 — tenant does not exist
+- 409 — site_id already exists for this tenant
+
+---
+
+### POST /v1/sites/{site_id}/cameras
+
+Registers a new camera on a site and mints an ingest token. **Super admin only.**
+
+**Query params:**
+- `tenant_id` (required)
+
+**Body:**
+```json
+{
+  "camera_id": "cam_01",
+  "camera_name": "North elevation",
+  "camera_model": "Axis P1455-LE"
+}
+```
+
+**Field rules:**
+- `camera_id` — required, must match `^[a-z0-9_]{1,64}$`
+- `camera_name` — required
+- `camera_model` — optional
+
+**Response (201):**
+```json
+{
+  "camera_id": "cam_01",
+  "ingest_url": "https://<api_id>.execute-api.eu-west-2.amazonaws.com/prod/v1/ingest/tk_...",
+  "ingest_token": "tk_8f2a4b9c1d7e3k5mQr9vL3kP7mN2xB8jY4hT5w"
+}
+```
+
+**Important:** The `ingest_token` is the camera's authentication credential. It is embedded in the `ingest_url` path. Configure the camera to POST JPEG snapshots to `ingest_url`. The token can be rotated if compromised.
+
+**Errors:**
+- 400 — missing tenant_id, invalid camera_id format, missing required fields
+- 403 — caller is not super_admin
+- 404 — site does not exist
+- 409 — camera_id already exists on this site
+
+---
+
+### GET /v1/sites/{site_id}/cameras
+
+Lists all cameras on a site. **Tenant admin or super admin.**
+
+**Query params:**
+- `tenant_id` (required for super admins; tenant admins use their own tenant from JWT)
+
+**Response (200):**
+```json
+{
+  "cameras": [
+    {
+      "camera_id": "cam_01",
+      "camera_name": "North elevation",
+      "camera_model": "Axis P1455-LE"
+    }
+  ]
+}
+```
+
+Returns an empty array if no cameras exist. Credentials are never included in this response.
+
+**Errors:**
+- 400 — super admin missing tenant_id query param
+- 403 — caller lacks required role
+- 404 — site does not exist
+
+---
+
+### POST /v1/sites/{site_id}/cameras/{camera_id}/rotate-credentials
+
+Rotates the ingest token for a camera. **Tenant admin or super admin.**
+
+**Query params:**
+- `tenant_id` (required for super admins; tenant admins use their own tenant from JWT)
+
+**No request body required.**
+
+**Response (200):**
+```json
+{
+  "camera_id": "cam_01",
+  "ingest_url": "https://<api_id>.execute-api.eu-west-2.amazonaws.com/prod/v1/ingest/tk_...",
+  "ingest_token": "tk_newRandom40charsHereAbcDefGhiJklMnoPqr"
+}
+```
+
+**Important:** The old token is immediately invalidated. The camera must be reconfigured with the new `ingest_url` (which contains the new token).
+
+**Errors:**
+- 400 — super admin missing tenant_id query param
+- 403 — caller lacks required role, or tenant admin accessing another tenant's camera
+- 404 — camera does not exist
+- 500 — token rotation failed (old token remains valid)
+
+---
+
+### POST /v1/users
+
+Creates a new user in the system. **Tenant admin or super admin.**
+
+**Body:**
+```json
+{
+  "email": "jane.doe@acme.example.com",
+  "full_name": "Jane Doe",
+  "tenant_id": "acme_corp",
+  "role": "user",
+  "site_access": ["site_001", "site_002"]
+}
+```
+
+**Field rules:**
+- `email` — required, valid email format
+- `full_name` — required
+- `tenant_id` — required for super admins; tenant admins are scoped to their own tenant (field ignored)
+- `role` — required, one of `user`, `tenant_admin`, `super_admin`
+- `site_access` — required when role is `user`, list of valid site_ids for the tenant
+
+**Role restrictions for tenant admins:**
+- Cannot create `super_admin` users (403)
+- Cannot create users in a different tenant (403)
+
+**Response (201):**
+```json
+{
+  "sub": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "email": "jane.doe@acme.example.com",
+  "full_name": "Jane Doe",
+  "tenant_id": "acme_corp",
+  "role": "user",
+  "site_access": ["site_001", "site_002"]
+}
+```
+
+The user receives an invitation email from Cognito with a temporary password.
+
+**Errors:**
+- 400 — missing required fields, invalid email, invalid role, missing site_access for user role, invalid site_id in site_access
+- 403 — caller lacks required role, tenant admin attempting cross-tenant or super_admin creation
+- 409 — email already exists in the user pool
+
+---
+
+### GET /v1/users
+
+Lists all users for a tenant. **Tenant admin or super admin.**
+
+**Query params:**
+- `tenant_id` (required for super admins; tenant admins use their own tenant from JWT)
+
+**Response (200):**
+```json
+{
+  "users": [
+    {
+      "sub": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "email": "jane.doe@acme.example.com",
+      "full_name": "Jane Doe",
+      "tenant_id": "acme_corp",
+      "role": "user",
+      "site_access": ["site_001", "site_002"]
+    },
+    {
+      "sub": "f9e8d7c6-b5a4-3210-fedc-ba9876543210",
+      "email": "admin@acme.example.com",
+      "full_name": "Admin User",
+      "tenant_id": "acme_corp",
+      "role": "tenant_admin",
+      "site_access": []
+    }
+  ]
+}
+```
+
+Returns an empty array if no users exist for the tenant. The `site_access` field is an empty array for `tenant_admin` and `super_admin` roles (they have implicit access to all sites).
+
+**Errors:**
+- 400 — super admin missing tenant_id query param
+- 403 — caller is a regular user (not tenant_admin or super_admin)
+- 500 — DynamoDB query failure
+
+---
+
+### DELETE /v1/snapshots
+
+Deletes one or more snapshot captures (removes both the DynamoDB record and the S3 image). **Tenant admin or super admin.**
+
+**Query params:**
+- `tenant_id` (required for super admins; tenant admins use their own tenant from JWT)
+
+**Body:**
+```json
+{
+  "site_id": "site_001",
+  "camera_id": "cam_01",
+  "timestamps": [
+    "2025-06-15T14:00:00Z",
+    "2025-06-15T13:00:00Z",
+    "2025-06-15T12:00:00Z"
+  ]
+}
+```
+
+**Field rules:**
+- `site_id` — required
+- `camera_id` — required
+- `timestamps` — required, array of ISO8601 UTC timestamp strings identifying the snapshots to delete
+- Maximum 25 snapshots per request
+
+**Response (200):**
+```json
+{
+  "deleted": ["2025-06-15T14:00:00Z", "2025-06-15T13:00:00Z"],
+  "deleted_count": 2,
+  "not_found": ["2025-06-15T12:00:00Z"]
+}
+```
+
+The `not_found` field is only present if some timestamps didn't match existing records. This is not an error — it allows idempotent retries.
+
+**Errors:**
+- 400 — missing required fields, timestamps not an array, exceeds batch limit (25)
+- 403 — caller is a regular user
+- 404 — site does not exist
+
+---
+
+### PATCH /v1/sites/{site_id}
+
+Updates site configuration. Currently supports setting ingest hours. **Tenant admin or super admin.**
+
+**Query params:**
+- `tenant_id` (required for super admins; tenant admins use their own tenant from JWT)
+
+**Body — set ingest hours:**
+```json
+{
+  "ingest_hours": {
+    "start": "07:00",
+    "end": "18:00"
+  }
+}
+```
+
+**Body — clear ingest hours (allow all hours):**
+```json
+{
+  "ingest_hours": null
+}
+```
+
+**Field rules:**
+- `ingest_hours` — object with `start` and `end` in HH:MM format (24-hour), or `null` to clear
+- `start` and `end` must be different
+- Supports overnight windows (e.g. `start: "22:00"`, `end: "06:00"`)
+- Times are interpreted in the site's configured timezone
+
+**Response (200):**
+```json
+{
+  "site_id": "site_001",
+  "tenant_id": "acme_corp",
+  "ingest_hours": {
+    "start": "07:00",
+    "end": "18:00"
+  }
+}
+```
+
+**Behaviour:** When ingest hours are configured, the ingest endpoint (`POST /v1/ingest/{token}`) still accepts requests at any time (returns 200) but only saves the image to S3/DynamoDB if the current time (in the site's timezone) falls within the configured window. Outside the window, the ingest response includes `"status": "skipped"` instead of the usual `key`/`sha256` fields.
+
+**Errors:**
+- 400 — invalid time format, start equals end, missing fields
+- 403 — caller is a regular user
+- 404 — site does not exist
+
+---
+
 ## What the API Does NOT Provide (Yet)
 
-These endpoints are documented in the API contract but not yet implemented (future phases):
+These endpoints are planned for future phases:
 
-- `POST /v1/tenants` — tenant CRUD (super admin)
-- `POST /v1/users` — user management
-- `POST /v1/sites` — site creation
-- `POST /v1/sites/{site_id}/cameras` — camera registration
 - `POST /v1/timelapses` — timelapse generation
 - `POST /v1/exports` — bulk image export
 
-For MVP, tenant/site/camera provisioning is done via CLI scripts. The dashboard should be designed with these admin UIs in mind but they can be stubbed initially.
+The dashboard should be designed with these features in mind but they can be stubbed initially.

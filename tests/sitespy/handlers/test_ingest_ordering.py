@@ -15,7 +15,6 @@ import json
 import os
 from unittest.mock import patch
 
-import bcrypt
 import boto3
 from botocore.exceptions import ClientError
 from moto import mock_aws
@@ -23,6 +22,8 @@ from moto import mock_aws
 from sitespy.errors import ApiError
 from sitespy.handlers.ingest import _handle, resolve_correlation_id
 from sitespy.http import error_response, unhandled_error_response
+
+_VALID_TOKEN = "tk_validtoken1234567890abcdefghijklmnopqr"
 
 
 def _invoke(event):
@@ -94,15 +95,17 @@ def _setup_aws():
     return s3, ddb
 
 
-def _seed_camera(ddb, tenant_id, site_id, camera_id, username, password):
-    hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt(rounds=12))
+def _seed_camera(ddb, tenant_id, site_id, camera_id, ingest_token):
+    """Write camera and tenant rows to mocked DynamoDB."""
     ddb.put_item(
         TableName="test-data-table",
         Item={
             "PK": {"S": f"TENANT#{tenant_id}"},
             "SK": {"S": f"SITE#{site_id}#CAM#{camera_id}"},
-            "ingest_username": {"S": username},
-            "ingest_password_hash": {"S": hashed.decode()},
+            "GSI1PK": {"S": f"TOKEN#{ingest_token}"},
+            "GSI1SK": {"S": "CAMERA"},
+            "camera_name": {"S": "Test Camera"},
+            "ingest_token": {"S": ingest_token},
         },
     )
     ddb.put_item(
@@ -115,19 +118,17 @@ def _seed_camera(ddb, tenant_id, site_id, camera_id, username, password):
     )
 
 
-def _make_event(tenant_id, site_id, camera_id, username, password):
+def _make_event(ingest_token):
+    """Build an ingest event using token-based URL path auth."""
     body = b"\xff\xd8\xff\xe0" + b"\x00" * 100
-    credentials = base64.b64encode(f"{username}:{password}".encode()).decode()
     return {
         "httpMethod": "POST",
-        "path": "/v1/ingest",
+        "path": f"/v1/ingest/{ingest_token}",
+        "pathParameters": {"token": ingest_token},
         "headers": {
-            "Authorization": f"Basic {credentials}",
-            "X-Tenant-ID": tenant_id,
-            "X-Site-ID": site_id,
             "Content-Type": "image/jpeg",
         },
-        "queryStringParameters": {"cameraID": camera_id},
+        "queryStringParameters": None,
         "body": base64.b64encode(body).decode(),
         "isBase64Encoded": True,
     }
@@ -140,10 +141,9 @@ def test_p5_img_write_fails_after_s3_success():
         s3, ddb = _setup_aws()
 
         tenant_id, site_id, camera_id = "acme", "site_01", "cam_01"
-        username, password = "sitespy_cam_ord", "ordpassword"
-        _seed_camera(ddb, tenant_id, site_id, camera_id, username, password)
+        _seed_camera(ddb, tenant_id, site_id, camera_id, _VALID_TOKEN)
 
-        event = _make_event(tenant_id, site_id, camera_id, username, password)
+        event = _make_event(_VALID_TOKEN)
 
         import sitespy.data as data_module
 
@@ -161,7 +161,6 @@ def test_p5_img_write_fails_after_s3_success():
         assert resp["error"] == "INTERNAL_ERROR"
 
         # S3 object IS present (S3 write succeeded before the IMG# failure)
-        # We can't know the exact timestamp, so list objects
         objs = s3.list_objects_v2(
             Bucket="test-snapshots-bucket", Prefix=f"{tenant_id}/{site_id}/{camera_id}/"
         )
@@ -183,10 +182,9 @@ def test_p5_s3_write_fails_no_img_record():
         _s3, ddb = _setup_aws()
 
         tenant_id, site_id, camera_id = "acme", "site_01", "cam_01"
-        username, password = "sitespy_cam_ord2", "ordpassword2"
-        _seed_camera(ddb, tenant_id, site_id, camera_id, username, password)
+        _seed_camera(ddb, tenant_id, site_id, camera_id, _VALID_TOKEN)
 
-        event = _make_event(tenant_id, site_id, camera_id, username, password)
+        event = _make_event(_VALID_TOKEN)
 
         import sitespy.data as data_module
         import sitespy.storage as storage_module

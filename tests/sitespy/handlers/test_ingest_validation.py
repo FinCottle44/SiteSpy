@@ -1,6 +1,9 @@
-"""Header/body validation partition tests.
+"""Token and body validation partition tests.
 
 Requirements validated: 1.2, 1.3, 1.4, 1.5, 1.6, 1.7
+
+The ingest handler uses token-based auth via URL path (/v1/ingest/{token}).
+Token format: ^tk_[A-Za-z0-9_-]{20,80}$
 """
 
 from __future__ import annotations
@@ -8,13 +11,17 @@ from __future__ import annotations
 import base64
 import os
 
+import boto3
 import pytest
+from moto import mock_aws
 
 from sitespy.errors import ApiError
 from sitespy.handlers.ingest import _handle, resolve_correlation_id
 from sitespy.http import error_response, unhandled_error_response
 
 _MAX_BODY = 10 * 1024 * 1024  # 10 MiB
+
+_VALID_TOKEN = "tk_validtoken1234567890abcdefghijklmnopqr"
 
 
 def _set_env():
@@ -37,6 +44,67 @@ def _set_env():
     _s3_client.cache_clear()
 
 
+def _setup_aws():
+    s3 = boto3.client("s3", region_name="eu-west-2")
+    s3.create_bucket(
+        Bucket="test-snapshots-bucket",
+        CreateBucketConfiguration={"LocationConstraint": "eu-west-2"},
+    )
+    s3.put_bucket_versioning(
+        Bucket="test-snapshots-bucket",
+        VersioningConfiguration={"Status": "Enabled"},
+    )
+    ddb = boto3.client("dynamodb", region_name="eu-west-2")
+    ddb.create_table(
+        TableName="test-data-table",
+        BillingMode="PAY_PER_REQUEST",
+        AttributeDefinitions=[
+            {"AttributeName": "PK", "AttributeType": "S"},
+            {"AttributeName": "SK", "AttributeType": "S"},
+            {"AttributeName": "GSI1PK", "AttributeType": "S"},
+            {"AttributeName": "GSI1SK", "AttributeType": "S"},
+        ],
+        KeySchema=[
+            {"AttributeName": "PK", "KeyType": "HASH"},
+            {"AttributeName": "SK", "KeyType": "RANGE"},
+        ],
+        GlobalSecondaryIndexes=[
+            {
+                "IndexName": "GSI1",
+                "KeySchema": [
+                    {"AttributeName": "GSI1PK", "KeyType": "HASH"},
+                    {"AttributeName": "GSI1SK", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "ALL"},
+            }
+        ],
+    )
+    return s3, ddb
+
+
+def _seed_camera(ddb, tenant_id, site_id, camera_id, ingest_token):
+    """Seed a camera with token-based GSI1 index."""
+    ddb.put_item(
+        TableName="test-data-table",
+        Item={
+            "PK": {"S": f"TENANT#{tenant_id}"},
+            "SK": {"S": f"SITE#{site_id}#CAM#{camera_id}"},
+            "GSI1PK": {"S": f"TOKEN#{ingest_token}"},
+            "GSI1SK": {"S": "CAMERA"},
+            "camera_name": {"S": "Test Camera"},
+            "ingest_token": {"S": ingest_token},
+        },
+    )
+    ddb.put_item(
+        TableName="test-data-table",
+        Item={
+            "PK": {"S": f"TENANT#{tenant_id}"},
+            "SK": {"S": f"TENANT#{tenant_id}"},
+            "retention_years": {"N": "5"},
+        },
+    )
+
+
 def _invoke(event):
     corr_id = resolve_correlation_id(event)
     try:
@@ -47,171 +115,125 @@ def _invoke(event):
         return unhandled_error_response(corr_id)
 
 
-def _make_valid_event(body=None):
+def _make_valid_event(token=_VALID_TOKEN, body=None):
+    """Build a valid ingest event with token-based auth."""
     if body is None:
         body = b"\xff\xd8\xff\xe0" + b"\x00" * 100
-    credentials = base64.b64encode(b"user:pass").decode()
     return {
         "httpMethod": "POST",
-        "path": "/v1/ingest",
+        "path": f"/v1/ingest/{token}",
+        "pathParameters": {"token": token},
         "headers": {
-            "Authorization": f"Basic {credentials}",
-            "X-Tenant-ID": "acme",
-            "X-Site-ID": "site_01",
             "Content-Type": "image/jpeg",
         },
-        "queryStringParameters": {"cameraID": "cam_01"},
+        "queryStringParameters": None,
         "body": base64.b64encode(body).decode(),
         "isBase64Encoded": True,
     }
 
 
 # ---------------------------------------------------------------------------
-# Missing required fields → 400
+# Token validation → 401
 # ---------------------------------------------------------------------------
 
 
-def test_missing_authorization_header():
+def test_missing_token():
+    """Missing token in path → 401."""
     _set_env()
-    event = _make_valid_event()
-    del event["headers"]["Authorization"]
+    event = _make_valid_event(token="")
     result = _invoke(event)
-    # Missing auth header → 401 (not 400) per spec
     assert result["statusCode"] == 401
 
 
-def test_missing_x_tenant_id():
+def test_invalid_token_format_no_prefix():
+    """Token without tk_ prefix → 401."""
     _set_env()
-    event = _make_valid_event()
-    del event["headers"]["X-Tenant-ID"]
+    event = _make_valid_event(token="noprefixtoken1234567890abcdefgh")
     result = _invoke(event)
-    assert result["statusCode"] == 400
+    assert result["statusCode"] == 401
 
 
-def test_missing_x_site_id():
+def test_invalid_token_format_too_short():
+    """Token with tk_ prefix but too short suffix → 401."""
     _set_env()
-    event = _make_valid_event()
-    del event["headers"]["X-Site-ID"]
+    event = _make_valid_event(token="tk_short")
     result = _invoke(event)
-    assert result["statusCode"] == 400
+    assert result["statusCode"] == 401
 
 
-def test_missing_camera_id():
+def test_invalid_token_format_special_chars():
+    """Token with invalid characters → 401."""
     _set_env()
-    event = _make_valid_event()
-    event["queryStringParameters"] = {}
+    event = _make_valid_event(token="tk_invalid!@#$%^&*()token12345")
     result = _invoke(event)
-    assert result["statusCode"] == 400
+    assert result["statusCode"] == 401
 
 
-def test_missing_content_type():
+def test_valid_token_no_camera_found():
+    """Valid token format but no camera in DB → 401."""
     _set_env()
-    event = _make_valid_event()
-    del event["headers"]["Content-Type"]
-    result = _invoke(event)
-    assert result["statusCode"] == 400
+    with mock_aws():
+        _setup_aws()
+        result = _invoke(_make_valid_event())
+    assert result["statusCode"] == 401
 
 
 # ---------------------------------------------------------------------------
-# Regex-invalid IDs → 400
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "tenant_id",
-    [
-        "UPPERCASE",
-        "has-hyphen",
-        "has space",
-        "a" * 65,  # too long (>64)
-        "",
-    ],
-)
-def test_invalid_tenant_id(tenant_id):
-    _set_env()
-    event = _make_valid_event()
-    if tenant_id == "":
-        del event["headers"]["X-Tenant-ID"]
-    else:
-        event["headers"]["X-Tenant-ID"] = tenant_id
-    result = _invoke(event)
-    assert result["statusCode"] in (400, 401)  # empty → 400, invalid → 400
-
-
-@pytest.mark.parametrize(
-    "site_id",
-    [
-        "UPPERCASE",
-        "has-hyphen",
-        "a" * 65,
-    ],
-)
-def test_invalid_site_id(site_id):
-    _set_env()
-    event = _make_valid_event()
-    event["headers"]["X-Site-ID"] = site_id
-    result = _invoke(event)
-    assert result["statusCode"] == 400
-
-
-@pytest.mark.parametrize(
-    "camera_id",
-    [
-        "UPPERCASE",
-        "has-hyphen",
-        "a" * 65,
-    ],
-)
-def test_invalid_camera_id(camera_id):
-    _set_env()
-    event = _make_valid_event()
-    event["queryStringParameters"]["cameraID"] = camera_id
-    result = _invoke(event)
-    assert result["statusCode"] == 400
-
-
-# ---------------------------------------------------------------------------
-# Body validation → 400
+# Body validation → 400 (requires valid auth first)
 # ---------------------------------------------------------------------------
 
 
 def test_empty_body():
     _set_env()
-    event = _make_valid_event()
-    event["body"] = ""
-    event["isBase64Encoded"] = False
-    result = _invoke(event)
+    with mock_aws():
+        _s3, ddb = _setup_aws()
+        _seed_camera(ddb, "acme", "site_01", "cam_01", _VALID_TOKEN)
+        event = _make_valid_event()
+        event["body"] = ""
+        event["isBase64Encoded"] = False
+        result = _invoke(event)
     assert result["statusCode"] == 400
 
 
 def test_bad_magic_bytes():
     _set_env()
-    bad_body = b"\x00\x01\x02\x03" + b"\x00" * 100
-    result = _invoke(_make_valid_event(body=bad_body))
+    with mock_aws():
+        _s3, ddb = _setup_aws()
+        _seed_camera(ddb, "acme", "site_01", "cam_01", _VALID_TOKEN)
+        bad_body = b"\x00\x01\x02\x03" + b"\x00" * 100
+        result = _invoke(_make_valid_event(body=bad_body))
     assert result["statusCode"] == 400
 
 
 def test_body_at_max_minus_1_is_accepted():
-    """Body at 10 MiB - 1 should pass body size validation (may fail auth)."""
+    """Body at 10 MiB - 1 should pass body size validation."""
     _set_env()
-    body = b"\xff\xd8\xff\xe0" + b"\x00" * (_MAX_BODY - 1 - 4)
-    result = _invoke(_make_valid_event(body=body))
-    # Should not be 400 for body size — may be 401 for auth
-    assert result["statusCode"] != 400 or "size" not in result.get("body", "").lower()
+    with mock_aws():
+        _s3, ddb = _setup_aws()
+        _seed_camera(ddb, "acme", "site_01", "cam_01", _VALID_TOKEN)
+        body = b"\xff\xd8\xff\xe0" + b"\x00" * (_MAX_BODY - 1 - 4)
+        result = _invoke(_make_valid_event(body=body))
+    # Should succeed (201) since auth and body are valid
+    assert result["statusCode"] == 201
 
 
 def test_body_at_max_is_accepted():
-    """Body at exactly 10 MiB should pass body size validation (may fail auth)."""
+    """Body at exactly 10 MiB should pass body size validation."""
     _set_env()
-    body = b"\xff\xd8\xff\xe0" + b"\x00" * (_MAX_BODY - 4)
-    result = _invoke(_make_valid_event(body=body))
-    # Should not be 400 for body size
-    assert result["statusCode"] != 400 or "size" not in result.get("body", "").lower()
+    with mock_aws():
+        _s3, ddb = _setup_aws()
+        _seed_camera(ddb, "acme", "site_01", "cam_01", _VALID_TOKEN)
+        body = b"\xff\xd8\xff\xe0" + b"\x00" * (_MAX_BODY - 4)
+        result = _invoke(_make_valid_event(body=body))
+    assert result["statusCode"] == 201
 
 
 def test_body_over_max_is_rejected():
     """Body at 10 MiB + 1 must return 400."""
     _set_env()
-    body = b"\xff\xd8\xff\xe0" + b"\x00" * (_MAX_BODY + 1 - 4)
-    result = _invoke(_make_valid_event(body=body))
+    with mock_aws():
+        _s3, ddb = _setup_aws()
+        _seed_camera(ddb, "acme", "site_01", "cam_01", _VALID_TOKEN)
+        body = b"\xff\xd8\xff\xe0" + b"\x00" * (_MAX_BODY + 1 - 4)
+        result = _invoke(_make_valid_event(body=body))
     assert result["statusCode"] == 400

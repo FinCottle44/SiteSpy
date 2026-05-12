@@ -3,8 +3,8 @@
 Property 7: Secret Redaction
 Validates: Requirement 10.5
 
-No log record contains the raw Authorization header value, decoded username,
-decoded password, or stored ingest_password_hash.
+No log record contains the raw ingest token value. The token is the
+authentication secret in the token-based auth model.
 """
 
 from __future__ import annotations
@@ -14,13 +14,14 @@ import json
 import logging
 import os
 
-import bcrypt
 import boto3
 from moto import mock_aws
 
 from sitespy.errors import ApiError
 from sitespy.handlers.ingest import _handle, resolve_correlation_id
 from sitespy.http import error_response, unhandled_error_response
+
+_VALID_TOKEN = "tk_supersecrettoken1234567890abcdefghijk"
 
 
 def _invoke(event):
@@ -92,15 +93,17 @@ def _setup_aws():
     return s3, ddb
 
 
-def _seed_camera(ddb, tenant_id, site_id, camera_id, username, password):
-    hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt(rounds=12))
+def _seed_camera(ddb, tenant_id, site_id, camera_id, ingest_token):
+    """Write camera and tenant rows to mocked DynamoDB."""
     ddb.put_item(
         TableName="test-data-table",
         Item={
             "PK": {"S": f"TENANT#{tenant_id}"},
             "SK": {"S": f"SITE#{site_id}#CAM#{camera_id}"},
-            "ingest_username": {"S": username},
-            "ingest_password_hash": {"S": hashed.decode()},
+            "GSI1PK": {"S": f"TOKEN#{ingest_token}"},
+            "GSI1SK": {"S": "CAMERA"},
+            "camera_name": {"S": "Test Camera"},
+            "ingest_token": {"S": ingest_token},
         },
     )
     ddb.put_item(
@@ -111,25 +114,20 @@ def _seed_camera(ddb, tenant_id, site_id, camera_id, username, password):
             "retention_years": {"N": "5"},
         },
     )
-    return hashed.decode()
 
 
-def _make_event(tenant_id, site_id, camera_id, username, password, body=None, omit_auth=False):
+def _make_event(ingest_token, body=None):
+    """Build an ingest event using token-based URL path auth."""
     if body is None:
         body = b"\xff\xd8\xff\xe0" + b"\x00" * 100
-    credentials = base64.b64encode(f"{username}:{password}".encode()).decode()
-    headers = {
-        "X-Tenant-ID": tenant_id,
-        "X-Site-ID": site_id,
-        "Content-Type": "image/jpeg",
-    }
-    if not omit_auth:
-        headers["Authorization"] = f"Basic {credentials}"
     return {
         "httpMethod": "POST",
-        "path": "/v1/ingest",
-        "headers": headers,
-        "queryStringParameters": {"cameraID": camera_id},
+        "path": f"/v1/ingest/{ingest_token}",
+        "pathParameters": {"token": ingest_token},
+        "headers": {
+            "Content-Type": "image/jpeg",
+        },
+        "queryStringParameters": None,
         "body": base64.b64encode(body).decode(),
         "isBase64Encoded": True,
     }
@@ -155,71 +153,60 @@ def _assert_no_secrets_in_logs(caplog_records, secrets):
 
 
 def test_p7_redaction_happy_path(caplog):
-    """P7: no secrets in logs on successful ingest."""
+    """P7: no token in logs on successful ingest."""
     _set_env()
     with mock_aws():
         _s3, ddb = _setup_aws()
+        _seed_camera(ddb, "acme", "site_01", "cam_01", _VALID_TOKEN)
 
-        username = "sitespy_cam_secret_user"
-        password = "super_secret_password_xyz"
-        stored_hash = _seed_camera(ddb, "acme", "site_01", "cam_01", username, password)
+        from sitespy.config import get_settings as _gs
+        from sitespy.data import _dynamodb_client as _ddb_c
+        from sitespy.storage import _s3_client as _s3c
 
-        credentials_b64 = base64.b64encode(f"{username}:{password}".encode()).decode()
-        event = _make_event("acme", "site_01", "cam_01", username, password)
+        _gs.cache_clear()
+        _ddb_c.cache_clear()
+        _s3c.cache_clear()
+
+        event = _make_event(_VALID_TOKEN)
 
         with caplog.at_level(logging.DEBUG):
             result = _invoke(event)
 
         assert result["statusCode"] == 201
 
-        secrets = [
-            f"Basic {credentials_b64}",
-            credentials_b64,
-            username,
-            password,
-            stored_hash,
-        ]
+        secrets = [_VALID_TOKEN]
         _assert_no_secrets_in_logs(caplog.records, secrets)
 
 
 def test_p7_redaction_auth_failure(caplog):
-    """P7: no secrets in logs on auth failure."""
+    """P7: no token in logs on auth failure (unknown token)."""
     _set_env()
+    unknown_token = "tk_unknowntoken1234567890abcdefghijklmno"
     with mock_aws():
-        _s3, ddb = _setup_aws()
+        _setup_aws()
 
-        username = "sitespy_cam_secret_user2"
-        password = "another_secret_password"
-        stored_hash = _seed_camera(ddb, "acme", "site_01", "cam_01", username, password)
-
-        credentials_b64 = base64.b64encode(f"{username}:wrongpassword".encode()).decode()
-        event = _make_event("acme", "site_01", "cam_01", username, "wrongpassword")
+        event = _make_event(unknown_token)
 
         with caplog.at_level(logging.DEBUG):
             result = _invoke(event)
 
         assert result["statusCode"] == 401
 
-        secrets = [
-            f"Basic {credentials_b64}",
-            credentials_b64,
-            username,
-            "wrongpassword",
-            stored_hash,
-        ]
+        secrets = [unknown_token]
         _assert_no_secrets_in_logs(caplog.records, secrets)
 
 
-def test_p7_redaction_missing_auth(caplog):
-    """P7: no secrets in logs when auth header is missing."""
+def test_p7_redaction_missing_token(caplog):
+    """P7: no crash when token is empty/missing."""
     _set_env()
     with mock_aws():
         _setup_aws()
 
+        event = _make_event("")
+
         with caplog.at_level(logging.DEBUG):
-            result = _invoke(_make_event("acme", "site_01", "cam_01", "u", "p", omit_auth=True))
+            result = _invoke(event)
 
         assert result["statusCode"] == 401
-        # No secrets to check — just verify no crash and envelope is correct
         body = json.loads(result["body"])
         assert body["error"] == "UNAUTHORIZED"

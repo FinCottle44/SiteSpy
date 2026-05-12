@@ -114,7 +114,7 @@ echo -e "${YELLOW}Creating Cognito users...${NC}"
 
 # --- Super Admin ---
 echo -n "  Creating super admin (fin@cottlecc.com)... "
-aws cognito-idp admin-create-user \
+SUPER_ADMIN_SUB=$(aws cognito-idp admin-create-user \
   --user-pool-id "$USER_POOL_ID" \
   --username "fin@cottlecc.com" \
   --temporary-password "$TEMP_PASSWORD" \
@@ -123,7 +123,8 @@ aws cognito-idp admin-create-user \
     Name=email_verified,Value=true \
   --region "$REGION" \
   --profile "$PROFILE" \
-  --no-cli-pager 2>/dev/null || true
+  --query 'User.Username' \
+  --output text 2>/dev/null || echo "existing")
 echo -e "${GREEN}done${NC}"
 
 echo -n "  Adding to SuperAdmins group... "
@@ -137,7 +138,7 @@ echo -e "${GREEN}done${NC}"
 
 # --- Tenant Admin ---
 echo -n "  Creating tenant admin (admin@red.test)... "
-aws cognito-idp admin-create-user \
+TENANT_ADMIN_SUB=$(aws cognito-idp admin-create-user \
   --user-pool-id "$USER_POOL_ID" \
   --username "admin@red.test" \
   --temporary-password "$TEMP_PASSWORD" \
@@ -147,7 +148,8 @@ aws cognito-idp admin-create-user \
     Name=custom:tenant_id,Value=$TENANT_ID \
   --region "$REGION" \
   --profile "$PROFILE" \
-  --no-cli-pager 2>/dev/null || true
+  --query 'User.Username' \
+  --output text 2>/dev/null || echo "existing")
 echo -e "${GREEN}done${NC}"
 
 echo -n "  Adding to TenantAdmins group... "
@@ -161,7 +163,7 @@ echo -e "${GREEN}done${NC}"
 
 # --- Regular User ---
 echo -n "  Creating regular user (viewer@red.test)... "
-aws cognito-idp admin-create-user \
+VIEWER_SUB=$(aws cognito-idp admin-create-user \
   --user-pool-id "$USER_POOL_ID" \
   --username "viewer@red.test" \
   --temporary-password "$TEMP_PASSWORD" \
@@ -172,7 +174,97 @@ aws cognito-idp admin-create-user \
     Name=custom:site_access,Value=$SITE_ID \
   --region "$REGION" \
   --profile "$PROFILE" \
-  --no-cli-pager 2>/dev/null || true
+  --query 'User.Username' \
+  --output text 2>/dev/null || echo "existing")
+echo -e "${GREEN}done${NC}"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. User_Record items in DynamoDB (mirrors what POST /v1/users writes)
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo -e "${YELLOW}Writing User_Records to DynamoDB...${NC}"
+
+# Look up actual subs if users already existed
+if [ "$SUPER_ADMIN_SUB" = "existing" ]; then
+  SUPER_ADMIN_SUB=$(aws cognito-idp admin-get-user \
+    --user-pool-id "$USER_POOL_ID" \
+    --username "fin@cottlecc.com" \
+    --region "$REGION" \
+    --profile "$PROFILE" \
+    --query 'Username' \
+    --output text 2>/dev/null)
+fi
+if [ "$TENANT_ADMIN_SUB" = "existing" ]; then
+  TENANT_ADMIN_SUB=$(aws cognito-idp admin-get-user \
+    --user-pool-id "$USER_POOL_ID" \
+    --username "admin@red.test" \
+    --region "$REGION" \
+    --profile "$PROFILE" \
+    --query 'Username' \
+    --output text 2>/dev/null)
+fi
+if [ "$VIEWER_SUB" = "existing" ]; then
+  VIEWER_SUB=$(aws cognito-idp admin-get-user \
+    --user-pool-id "$USER_POOL_ID" \
+    --username "viewer@red.test" \
+    --region "$REGION" \
+    --profile "$PROFILE" \
+    --query 'Username' \
+    --output text 2>/dev/null)
+fi
+
+# Super admin user record
+echo -n "  Writing super admin user record... "
+aws dynamodb put-item \
+  --table-name "$TABLE" \
+  --region "$REGION" \
+  --profile "$PROFILE" \
+  --item "{
+    \"PK\": {\"S\": \"TENANT#$TENANT_ID\"},
+    \"SK\": {\"S\": \"USER#$SUPER_ADMIN_SUB\"},
+    \"sub\": {\"S\": \"$SUPER_ADMIN_SUB\"},
+    \"email\": {\"S\": \"fin@cottlecc.com\"},
+    \"full_name\": {\"S\": \"Fin Cottle\"},
+    \"tenant_id\": {\"S\": \"$TENANT_ID\"},
+    \"role\": {\"S\": \"super_admin\"},
+    \"site_access\": {\"L\": []}
+  }" 2>/dev/null
+echo -e "${GREEN}done${NC}"
+
+# Tenant admin user record
+echo -n "  Writing tenant admin user record... "
+aws dynamodb put-item \
+  --table-name "$TABLE" \
+  --region "$REGION" \
+  --profile "$PROFILE" \
+  --item "{
+    \"PK\": {\"S\": \"TENANT#$TENANT_ID\"},
+    \"SK\": {\"S\": \"USER#$TENANT_ADMIN_SUB\"},
+    \"sub\": {\"S\": \"$TENANT_ADMIN_SUB\"},
+    \"email\": {\"S\": \"admin@red.test\"},
+    \"full_name\": {\"S\": \"Red Admin\"},
+    \"tenant_id\": {\"S\": \"$TENANT_ID\"},
+    \"role\": {\"S\": \"tenant_admin\"},
+    \"site_access\": {\"L\": []}
+  }" 2>/dev/null
+echo -e "${GREEN}done${NC}"
+
+# Regular user record
+echo -n "  Writing regular user record... "
+aws dynamodb put-item \
+  --table-name "$TABLE" \
+  --region "$REGION" \
+  --profile "$PROFILE" \
+  --item "{
+    \"PK\": {\"S\": \"TENANT#$TENANT_ID\"},
+    \"SK\": {\"S\": \"USER#$VIEWER_SUB\"},
+    \"sub\": {\"S\": \"$VIEWER_SUB\"},
+    \"email\": {\"S\": \"viewer@red.test\"},
+    \"full_name\": {\"S\": \"Red Viewer\"},
+    \"tenant_id\": {\"S\": \"$TENANT_ID\"},
+    \"role\": {\"S\": \"user\"},
+    \"site_access\": {\"L\": [{\"S\": \"$SITE_ID\"}]}
+  }" 2>/dev/null
 echo -e "${GREEN}done${NC}"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -187,11 +279,12 @@ echo "Data seeded:"
 echo "  • Tenant:  $TENANT_ID ($TENANT_NAME)"
 echo "  • Site:    $SITE_ID ($SITE_NAME)"
 echo "  • Camera:  $CAMERA_ID ($CAMERA_NAME, $CAMERA_MODEL)"
+echo "  • Users:   3 User_Records in DynamoDB"
 echo ""
 echo "Cognito users (all temp password: $TEMP_PASSWORD):"
-echo "  • fin@cottlecc.com   → SuperAdmin"
-echo "  • admin@red.test     → TenantAdmin ($TENANT_ID)"
-echo "  • viewer@red.test    → User ($TENANT_ID, site: $SITE_ID)"
+echo "  • fin@cottlecc.com   → SuperAdmin (sub: $SUPER_ADMIN_SUB)"
+echo "  • admin@red.test     → TenantAdmin ($TENANT_ID) (sub: $TENANT_ADMIN_SUB)"
+echo "  • viewer@red.test    → User ($TENANT_ID, site: $SITE_ID) (sub: $VIEWER_SUB)"
 echo ""
 echo -e "${CYAN}Camera ingest token:${NC}"
 echo "  $INGEST_TOKEN"

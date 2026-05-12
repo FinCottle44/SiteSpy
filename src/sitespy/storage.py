@@ -93,6 +93,18 @@ def generate_presigned_url(key: str, expires_in: int = 300) -> str:
     )
 
 
+def delete_snapshot(key: str) -> None:
+    """Delete a snapshot object from S3.
+
+    Args:
+        key: Canonical S3 object key to delete.
+    """
+    _s3_client().delete_object(
+        Bucket=get_settings().snapshots_bucket,
+        Key=key,
+    )
+
+
 def put_snapshot(
     key: str,
     body: bytes,

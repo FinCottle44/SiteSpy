@@ -27,6 +27,25 @@ Parameters:
     Description: Cognito User Pool App Client ID for dashboard authentication.
     Default: ""
 
+  DomainName:
+    Type: String
+    Description: Custom domain name for the API (prod only).
+    Default: api.sitespy.io
+
+  CertificateArn:
+    Type: String
+    Description: ACM certificate ARN for the custom domain (prod only, must be in same region).
+    Default: ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Conditions
+# ─────────────────────────────────────────────────────────────────────────────
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+  HasCustomDomain: !And
+    - !Condition IsProd
+    - !Not [!Equals [!Ref CertificateArn, ""]]
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Globals
 # ─────────────────────────────────────────────────────────────────────────────
@@ -57,12 +76,12 @@ Globals:
 Resources:
 
   # ── S3: snapshot storage ──────────────────────────────────────────────────
-  # TODO(prod): Change DeletionPolicy and UpdateReplacePolicy back to Retain
-  # on both SnapshotsBucket and DataTable before deploying to production.
+  # DeletionPolicy=Retain protects prod data. For dev cleanup, delete the
+  # bucket manually after tearing down the stack.
   SnapshotsBucket:
     Type: AWS::S3::Bucket
-    DeletionPolicy: Delete
-    UpdateReplacePolicy: Delete
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       BucketName: !Sub sitespy-${Environment}-snapshots-${AWS::AccountId}
       PublicAccessBlockConfiguration:
@@ -99,10 +118,11 @@ Resources:
   # requirements/api_contract.md (Flagged Cameras + image records).
   DataTable:
     Type: AWS::DynamoDB::Table
-    DeletionPolicy: Delete
-    UpdateReplacePolicy: Delete
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       TableName: !Sub sitespy-${Environment}-data
+      DeletionProtectionEnabled: !If [IsProd, true, false]
       BillingMode: PAY_PER_REQUEST
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: true
@@ -155,7 +175,7 @@ Resources:
           DataTraceEnabled: false
           MetricsEnabled: true
       Cors:
-        AllowMethods: "'GET,POST,PATCH,OPTIONS'"
+        AllowMethods: "'GET,POST,PATCH,DELETE,OPTIONS'"
         AllowHeaders: "'Content-Type,Authorization,X-Correlation-Id'"
         AllowOrigin: "'*'"
       GatewayResponses:
@@ -164,13 +184,13 @@ Resources:
             Headers:
               Access-Control-Allow-Origin: "'*'"
               Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Correlation-Id'"
-              Access-Control-Allow-Methods: "'GET,POST,PATCH,OPTIONS'"
+              Access-Control-Allow-Methods: "'GET,POST,PATCH,DELETE,OPTIONS'"
         DEFAULT_5XX:
           ResponseParameters:
             Headers:
               Access-Control-Allow-Origin: "'*'"
               Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Correlation-Id'"
-              Access-Control-Allow-Methods: "'GET,POST,PATCH,OPTIONS'"
+              Access-Control-Allow-Methods: "'GET,POST,PATCH,DELETE,OPTIONS'"
       Auth:
         DefaultAuthorizer: CognitoAuthorizer
         AddDefaultAuthorizerToCorsPreflight: false
@@ -344,6 +364,213 @@ Resources:
             Path: /v1/flags/{flag_id}
             Method: PATCH
 
+  # ── Tenants POST Lambda ──────────────────────────────────────────────────
+  TenantsPostFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub sitespy-${Environment}-tenants-post
+      CodeUri: src/
+      Handler: sitespy.handlers.tenants_post.handler
+      Description: Creates a new tenant (super admin only).
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DataTable
+      Events:
+        PostTenant:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SiteSpyApi
+            Path: /v1/tenants
+            Method: POST
+
+  # ── Sites POST Lambda ──────────────────────────────────────────────────────
+  SitesPostFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub sitespy-${Environment}-sites-post
+      CodeUri: src/
+      Handler: sitespy.handlers.sites_post.handler
+      Description: Registers a new site under a tenant (super admin only).
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DataTable
+      Events:
+        PostSite:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SiteSpyApi
+            Path: /v1/sites
+            Method: POST
+
+  # ── Cameras POST Lambda ────────────────────────────────────────────────────
+  CamerasPostFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub sitespy-${Environment}-cameras-post
+      CodeUri: src/
+      Handler: sitespy.handlers.cameras_post.handler
+      Description: Registers a new camera on a site and returns the ingest token (super admin only).
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DataTable
+      Events:
+        PostCamera:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SiteSpyApi
+            Path: /v1/sites/{site_id}/cameras
+            Method: POST
+
+  # ── Users POST Lambda ──────────────────────────────────────────────────────
+  UsersPostFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub sitespy-${Environment}-users-post
+      CodeUri: src/
+      Handler: sitespy.handlers.users_post.handler
+      Description: Creates a new user in a tenant (tenant admin or super admin).
+      Environment:
+        Variables:
+          COGNITO_USER_POOL_ID: !Ref CognitoUserPoolId
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DataTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - cognito-idp:AdminCreateUser
+                - cognito-idp:AdminAddUserToGroup
+                - cognito-idp:AdminGetUser
+              Resource: !Sub "arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${CognitoUserPoolId}"
+      Events:
+        PostUser:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SiteSpyApi
+            Path: /v1/users
+            Method: POST
+
+  # ── Cameras GET Lambda ─────────────────────────────────────────────────────
+  CamerasGetFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub sitespy-${Environment}-cameras-get
+      CodeUri: src/
+      Handler: sitespy.handlers.cameras_get.handler
+      Description: Lists all cameras for a site (tenant admin or super admin).
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref DataTable
+      Events:
+        GetCameras:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SiteSpyApi
+            Path: /v1/sites/{site_id}/cameras
+            Method: GET
+
+  # ── Cameras DELETE Lambda ──────────────────────────────────────────────────
+  CamerasDeleteFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub sitespy-${Environment}-cameras-delete
+      CodeUri: src/
+      Handler: sitespy.handlers.cameras_delete.handler
+      Description: Deletes a camera from a site (super admin only).
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DataTable
+      Events:
+        DeleteCamera:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SiteSpyApi
+            Path: /v1/sites/{site_id}/cameras/{camera_id}
+            Method: DELETE
+
+  # ── Users GET Lambda ─────────────────────────────────────────────────────────
+  UsersGetFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub sitespy-${Environment}-users-get
+      CodeUri: src/
+      Handler: sitespy.handlers.users_get.handler
+      Description: Lists all users for a tenant (tenant admin or super admin).
+      MemorySize: 256
+      Timeout: 10
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref DataTable
+      Events:
+        GetUsers:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SiteSpyApi
+            Path: /v1/users
+            Method: GET
+
+  # ── Cameras Rotate Credentials Lambda ──────────────────────────────────────
+  CamerasRotateFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub sitespy-${Environment}-cameras-rotate
+      CodeUri: src/
+      Handler: sitespy.handlers.cameras_rotate.handler
+      Description: Rotates camera ingest token (tenant admin or super admin).
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DataTable
+      Events:
+        RotateCredentials:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SiteSpyApi
+            Path: /v1/sites/{site_id}/cameras/{camera_id}/rotate-credentials
+            Method: POST
+
+  # ── Sites PATCH Lambda ────────────────────────────────────────────────────
+  SitesPatchFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub sitespy-${Environment}-sites-patch
+      CodeUri: src/
+      Handler: sitespy.handlers.sites_patch.handler
+      Description: Updates site configuration (ingest hours). Tenant admin or super admin.
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DataTable
+      Events:
+        PatchSite:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SiteSpyApi
+            Path: /v1/sites/{site_id}
+            Method: PATCH
+
+  # ── Snapshots DELETE Lambda ───────────────────────────────────────────────
+  SnapshotsDeleteFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub sitespy-${Environment}-snapshots-delete
+      CodeUri: src/
+      Handler: sitespy.handlers.snapshots_delete.handler
+      Description: Deletes snapshot captures (tenant admin or super admin).
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DataTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:DeleteObject
+              Resource: !Sub "arn:aws:s3:::${SnapshotsBucket}/*"
+      Events:
+        DeleteSnapshots:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SiteSpyApi
+            Path: /v1/snapshots
+            Method: DELETE
+
   # ── Ingest Lambda ─────────────────────────────────────────────────────────
   IngestFunction:
     Type: AWS::Serverless::Function
@@ -374,6 +601,32 @@ Resources:
               Authorizer: NONE
             # No API Gateway authorizer — token auth is validated inside the Lambda.
 
+  # ── Custom Domain (prod only) ─────────────────────────────────────────────
+  ApiDomainName:
+    Type: AWS::ApiGateway::DomainName
+    Condition: HasCustomDomain
+    Properties:
+      DomainName: !Ref DomainName
+      RegionalCertificateArn: !Ref CertificateArn
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      SecurityPolicy: TLS_1_2
+      Tags:
+        - Key: Project
+          Value: SiteSpy
+        - Key: Environment
+          Value: !Ref Environment
+
+  ApiBasePathMapping:
+    Type: AWS::ApiGateway::BasePathMapping
+    Condition: HasCustomDomain
+    DependsOn: SiteSpyApiprodStage
+    Properties:
+      DomainName: !Ref ApiDomainName
+      RestApiId: !Ref SiteSpyApi
+      Stage: prod
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Outputs
 # ─────────────────────────────────────────────────────────────────────────────
@@ -383,6 +636,16 @@ Outputs:
     Value: !Sub https://${SiteSpyApi}.execute-api.${AWS::Region}.amazonaws.com/prod
     Export:
       Name: !Sub sitespy-${Environment}-api-endpoint
+
+  CustomDomainUrl:
+    Condition: HasCustomDomain
+    Description: Custom domain URL for the SiteSpy API.
+    Value: !Sub https://${DomainName}
+
+  CustomDomainTarget:
+    Condition: HasCustomDomain
+    Description: CNAME target for Cloudflare DNS — point api.sitespy.io to this value.
+    Value: !GetAtt ApiDomainName.RegionalDomainName
 
   IngestUrl:
     Description: Ingest URL template — replace {token} with the camera's ingest token.

@@ -19,7 +19,6 @@ import hashlib
 import json
 import os
 
-import bcrypt
 import boto3
 from hypothesis import given, settings
 from hypothesis import strategies as st
@@ -34,8 +33,9 @@ from sitespy.storage import _s3_client
 # ---------------------------------------------------------------------------
 
 _ID_ST = st.from_regex(r"^[a-z0-9_]{1,64}$", fullmatch=True)
-# JPEG bodies: 3 B to 1 MiB, magic-byte prefixed
-_BODY_ST = st.integers(min_value=3, max_value=1024 * 1024).map(
+_TOKEN_SUFFIX_ST = st.from_regex(r"^[A-Za-z0-9_-]{40}$", fullmatch=True)
+# JPEG bodies: 4 B to 1 KiB, magic-byte prefixed (kept small for speed)
+_BODY_ST = st.integers(min_value=4, max_value=1024).map(
     lambda n: b"\xff\xd8\xff\xe0" + b"\x00" * (n - 4)
 )
 
@@ -85,16 +85,17 @@ def _setup_aws():
     return s3, ddb
 
 
-def _seed_camera(ddb, tenant_id, site_id, camera_id, username, password, retention_years=5):
+def _seed_camera(ddb, tenant_id, site_id, camera_id, ingest_token, retention_years=5):
     """Write camera and tenant rows to mocked DynamoDB."""
-    hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt(rounds=12))
     ddb.put_item(
         TableName="test-data-table",
         Item={
             "PK": {"S": f"TENANT#{tenant_id}"},
             "SK": {"S": f"SITE#{site_id}#CAM#{camera_id}"},
-            "ingest_username": {"S": username},
-            "ingest_password_hash": {"S": hashed.decode()},
+            "GSI1PK": {"S": f"TOKEN#{ingest_token}"},
+            "GSI1SK": {"S": "CAMERA"},
+            "camera_name": {"S": "Test Camera"},
+            "ingest_token": {"S": ingest_token},
         },
     )
     ddb.put_item(
@@ -107,18 +108,16 @@ def _seed_camera(ddb, tenant_id, site_id, camera_id, username, password, retenti
     )
 
 
-def _make_event(tenant_id, site_id, camera_id, body, username, password):
-    credentials = base64.b64encode(f"{username}:{password}".encode()).decode()
+def _make_event(ingest_token, body):
+    """Build an ingest event using token-based URL path auth."""
     return {
         "httpMethod": "POST",
-        "path": "/v1/ingest",
+        "path": f"/v1/ingest/{ingest_token}",
+        "pathParameters": {"token": ingest_token},
         "headers": {
-            "Authorization": f"Basic {credentials}",
-            "X-Tenant-ID": tenant_id,
-            "X-Site-ID": site_id,
             "Content-Type": "image/jpeg",
         },
-        "queryStringParameters": {"cameraID": camera_id},
+        "queryStringParameters": None,
         "body": base64.b64encode(body).decode(),
         "isBase64Encoded": True,
     }
@@ -133,10 +132,11 @@ def _make_event(tenant_id, site_id, camera_id, body, username, password):
     tenant_id=_ID_ST,
     site_id=_ID_ST,
     camera_id=_ID_ST,
+    token_suffix=_TOKEN_SUFFIX_ST,
     body=_BODY_ST,
 )
-@settings(max_examples=20, deadline=None)  # bcrypt cost 4 still takes time; 20 is enough for CI
-def test_p1_integrity_transitive_hash_equality(tenant_id, site_id, camera_id, body):
+@settings(max_examples=20, deadline=None)
+def test_p1_integrity_transitive_hash_equality(tenant_id, site_id, camera_id, token_suffix, body):
     """P1: four-way SHA-256 equality across response / IMG# / S3 metadata / S3 body."""
     os.environ["SNAPSHOTS_BUCKET"] = "test-snapshots-bucket"
     os.environ["DATA_TABLE"] = "test-data-table"
@@ -155,11 +155,11 @@ def test_p1_integrity_transitive_hash_equality(tenant_id, site_id, camera_id, bo
     _s3_client.cache_clear()
     _dynamodb_client.cache_clear()
 
+    ingest_token = f"tk_{token_suffix}"
+
     with mock_aws():
         s3, ddb = _setup_aws()
-        username = "sitespy_cam_testuser"
-        password = "testpassword123"
-        _seed_camera(ddb, tenant_id, site_id, camera_id, username, password, retention_years=7)
+        _seed_camera(ddb, tenant_id, site_id, camera_id, ingest_token, retention_years=7)
 
         # Clear caches inside the mock context to ensure fresh clients
         from sitespy.config import get_settings as _gs
@@ -170,7 +170,7 @@ def test_p1_integrity_transitive_hash_equality(tenant_id, site_id, camera_id, bo
         _ddb_client.cache_clear()
         _s3c.cache_clear()
 
-        event = _make_event(tenant_id, site_id, camera_id, body, username, password)
+        event = _make_event(ingest_token, body)
         result = _handle(event, "test-correlation-id")
 
         assert result["statusCode"] == 201

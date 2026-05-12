@@ -181,6 +181,30 @@ def _handle(event: dict[str, Any], correlation_id: str) -> dict[str, Any]:
     if not body.startswith(_JPEG_MAGIC):
         raise BadRequest("Request body must be a valid JPEG (magic bytes FF D8 FF).")
 
+    # --- Check ingest hours ---
+    # If the site has ingest_hours configured, check whether the current time
+    # (in the site's timezone) falls within the allowed window. If not, accept
+    # the request (200) but skip saving the image.
+    if _is_outside_ingest_hours(tenant_id, site_id):
+        logger.info(
+            "ingest_skipped_outside_hours",
+            extra={
+                "tenant_id": tenant_id,
+                "site_id": site_id,
+                "camera_id": camera_id,
+                "correlation_id": correlation_id,
+            },
+        )
+        return json_response(
+            200,
+            {
+                "status": "skipped",
+                "reason": "outside_ingest_hours",
+                "camera_id": camera_id,
+            },
+            correlation_id,
+        )
+
     # --- Hash, key, S3 write, DynamoDB write ---
     snapshot_ts = datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     sha256_hex = hashlib.sha256(body).hexdigest()
@@ -232,6 +256,73 @@ def resolve_correlation_id(event: dict[str, Any]) -> str:
     if _CORRELATION_ID_RE.match(value):
         return value
     return str(uuid.uuid4())
+
+
+def _is_outside_ingest_hours(tenant_id: str, site_id: str) -> bool:
+    """Check if the current time is outside the site's configured ingest hours.
+
+    Returns False (allow ingest) if:
+    - No ingest_hours are configured on the site
+    - The site doesn't exist (shouldn't happen at this point)
+    - The current time in the site's timezone is within the configured window
+
+    Returns True (skip ingest) if the current time is outside the window.
+
+    Supports overnight windows (e.g. start=22:00, end=06:00).
+    """
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    try:
+        ingest_hours = data.get_site_ingest_hours(tenant_id, site_id)
+    except Exception:
+        logger.exception("failed_to_fetch_ingest_hours")
+        # On failure, allow ingest (fail open)
+        return False
+
+    if ingest_hours is None:
+        return False
+
+    start_str = ingest_hours.get("start", "")
+    end_str = ingest_hours.get("end", "")
+
+    if not start_str or not end_str:
+        return False
+
+    # Get the site's timezone
+    try:
+        site_item = data.get_site(tenant_id, site_id)
+    except Exception:
+        logger.exception("failed_to_fetch_site_for_timezone")
+        return False
+
+    if site_item is None:
+        return False
+
+    tz_str = site_item.get("timezone", {}).get("S", "UTC")
+    try:
+        site_tz = ZoneInfo(tz_str)
+    except (ZoneInfoNotFoundError, KeyError, ValueError):
+        site_tz = ZoneInfo("UTC")
+
+    # Get current time in site's timezone
+    now_local = datetime.now(tz=UTC).astimezone(site_tz)
+    current_minutes = now_local.hour * 60 + now_local.minute
+
+    # Parse start/end into minutes since midnight
+    start_parts = start_str.split(":")
+    end_parts = end_str.split(":")
+    start_minutes = int(start_parts[0]) * 60 + int(start_parts[1])
+    end_minutes = int(end_parts[0]) * 60 + int(end_parts[1])
+
+    # Check if current time is within the window
+    if start_minutes < end_minutes:
+        # Normal window (e.g. 07:00 to 18:00)
+        is_within = start_minutes <= current_minutes < end_minutes
+    else:
+        # Overnight window (e.g. 22:00 to 06:00)
+        is_within = current_minutes >= start_minutes or current_minutes < end_minutes
+
+    return not is_within
 
 
 def _decode_body(event: dict[str, Any]) -> bytes:

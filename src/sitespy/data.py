@@ -1,12 +1,13 @@
 """DynamoDB helpers for SiteSpy — key builders and table operations.
 
-Requirements validated: 2.3, 5.6, 6.1, 6.2, 7.2, 7.5, 7.6, 8.1, 8.2, 8.3, 8.4, 8.5
+Requirements validated: 1.1, 1.9, 2.3, 2.12, 2.13, 3.11, 3.12, 3.14, 5.6, 6.1, 6.2, 7.2, 7.5, 7.6, 8.1, 8.2, 8.3, 8.4, 8.5
 """
 
 from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
+from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any
 
@@ -48,6 +49,11 @@ def build_tenant_sk(tenant_id: str) -> str:
 def build_camera_sk(site_id: str, camera_id: str) -> str:
     """Build the DynamoDB sort key for a camera item."""
     return f"SITE#{site_id}#CAM#{camera_id}"
+
+
+def build_user_sk(sub: str) -> str:
+    """Build the DynamoDB sort key for a user item."""
+    return f"USER#{sub}"
 
 
 # ---------------------------------------------------------------------------
@@ -577,3 +583,393 @@ def put_img_record(
             "content_type": {"S": "image/jpeg"},
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# Tenant write/read operations (admin management)
+# ---------------------------------------------------------------------------
+
+
+def get_tenant(tenant_id: str) -> Mapping[str, Any] | None:
+    """Fetch a tenant record from DynamoDB.
+
+    Single GetItem keyed by (TENANT#<tenant_id>, TENANT#<tenant_id>).
+    Returns None if the item does not exist.
+
+    Requirements: 2.5 (verify tenant exists before site creation)
+    """
+    response: dict[str, Any] = _dynamodb_client().get_item(
+        TableName=get_settings().data_table,
+        Key={
+            "PK": {"S": build_tenant_pk(tenant_id)},
+            "SK": {"S": build_tenant_sk(tenant_id)},
+        },
+    )
+    return response.get("Item")
+
+
+def put_tenant(
+    tenant_id: str,
+    tenant_name: str,
+    primary_contact_email: str,
+    stale_threshold_hours: int,
+) -> Mapping[str, Any]:
+    """Write a new tenant record to DynamoDB with uniqueness enforcement.
+
+    Uses ConditionExpression attribute_not_exists(PK) to prevent overwriting
+    an existing tenant. Raises botocore ClientError with code
+    ConditionalCheckFailedException if the tenant already exists.
+
+    Returns the written item as a plain dict (not DynamoDB-typed).
+
+    Requirements: 1.1, 1.9
+    """
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    item: dict[str, Any] = {
+        "PK": {"S": build_tenant_pk(tenant_id)},
+        "SK": {"S": build_tenant_sk(tenant_id)},
+        "tenant_name": {"S": tenant_name},
+        "primary_contact_email": {"S": primary_contact_email},
+        "stale_threshold_hours": {"N": str(stale_threshold_hours)},
+        "created_at": {"S": now},
+    }
+
+    _dynamodb_client().put_item(
+        TableName=get_settings().data_table,
+        Item=item,
+        ConditionExpression="attribute_not_exists(PK)",
+    )
+
+    return {
+        "tenant_id": tenant_id,
+        "tenant_name": tenant_name,
+        "primary_contact_email": primary_contact_email,
+        "stale_threshold_hours": stale_threshold_hours,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Site write operations (admin management)
+# ---------------------------------------------------------------------------
+
+
+def put_site(
+    tenant_id: str,
+    site_id: str,
+    site_name: str,
+    latitude: float,
+    longitude: float,
+    timezone_str: str,
+) -> Mapping[str, Any]:
+    """Write a new site record to DynamoDB with uniqueness enforcement.
+
+    Uses ConditionExpression attribute_not_exists(PK) AND attribute_not_exists(SK)
+    to prevent overwriting an existing site within the tenant.
+    Raises botocore ClientError with code ConditionalCheckFailedException
+    if the site already exists.
+
+    Returns the written item as a plain dict (not DynamoDB-typed).
+
+    Requirements: 2.12, 2.13
+    """
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    item: dict[str, Any] = {
+        "PK": {"S": build_tenant_pk(tenant_id)},
+        "SK": {"S": build_site_sk(site_id)},
+        "site_name": {"S": site_name},
+        "latitude": {"N": str(latitude)},
+        "longitude": {"N": str(longitude)},
+        "timezone": {"S": timezone_str},
+        "created_at": {"S": now},
+    }
+
+    _dynamodb_client().put_item(
+        TableName=get_settings().data_table,
+        Item=item,
+        ConditionExpression="attribute_not_exists(PK) AND attribute_not_exists(SK)",
+    )
+
+    return {
+        "site_id": site_id,
+        "site_name": site_name,
+        "tenant_id": tenant_id,
+        "latitude": latitude,
+        "longitude": longitude,
+        "timezone": timezone_str,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Camera write/delete operations (admin management)
+# ---------------------------------------------------------------------------
+
+
+def put_camera(
+    tenant_id: str,
+    site_id: str,
+    camera_id: str,
+    camera_name: str,
+    camera_model: str | None,
+    ingest_token: str,
+) -> Mapping[str, Any]:
+    """Write a new camera record to DynamoDB with uniqueness enforcement.
+
+    Uses ConditionExpression attribute_not_exists(PK) AND attribute_not_exists(SK)
+    to prevent overwriting an existing camera on the site.
+    Raises botocore ClientError with code ConditionalCheckFailedException
+    if the camera already exists.
+
+    The ingest_token is written as GSI1PK = TOKEN#<token>, GSI1SK = CAMERA
+    so the ingest handler can look up the camera by token via GSI1.
+
+    Returns the written item as a plain dict (not DynamoDB-typed).
+
+    Requirements: 3.11, 3.12
+    """
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    item: dict[str, Any] = {
+        "PK": {"S": build_tenant_pk(tenant_id)},
+        "SK": {"S": build_camera_sk(site_id, camera_id)},
+        "GSI1PK": {"S": f"TOKEN#{ingest_token}"},
+        "GSI1SK": {"S": "CAMERA"},
+        "camera_name": {"S": camera_name},
+        "ingest_token": {"S": ingest_token},
+        "created_at": {"S": now},
+    }
+    if camera_model is not None:
+        item["camera_model"] = {"S": camera_model}
+
+    _dynamodb_client().put_item(
+        TableName=get_settings().data_table,
+        Item=item,
+        ConditionExpression="attribute_not_exists(PK) AND attribute_not_exists(SK)",
+    )
+
+    result: dict[str, Any] = {
+        "camera_id": camera_id,
+        "camera_name": camera_name,
+    }
+    if camera_model is not None:
+        result["camera_model"] = camera_model
+    return result
+
+
+def update_camera_token(
+    tenant_id: str,
+    site_id: str,
+    camera_id: str,
+    new_token: str,
+) -> None:
+    """Update a camera's ingest token in DynamoDB.
+
+    Overwrites the GSI1PK, GSI1SK, and ingest_token attributes so the
+    ingest handler resolves the new token to this camera. The old token
+    becomes immediately invalid (no GSI1 entry points to it).
+
+    Requirements: 6.1–6.10
+    """
+    _dynamodb_client().update_item(
+        TableName=get_settings().data_table,
+        Key={
+            "PK": {"S": build_tenant_pk(tenant_id)},
+            "SK": {"S": build_camera_sk(site_id, camera_id)},
+        },
+        UpdateExpression=(
+            "SET GSI1PK = :gsi1pk, GSI1SK = :gsi1sk, ingest_token = :token"
+        ),
+        ExpressionAttributeValues={
+            ":gsi1pk": {"S": f"TOKEN#{new_token}"},
+            ":gsi1sk": {"S": "CAMERA"},
+            ":token": {"S": new_token},
+        },
+    )
+
+
+def delete_camera(tenant_id: str, site_id: str, camera_id: str) -> None:
+    """Delete a camera record from DynamoDB.
+
+    Used for rollback scenarios when Secrets Manager write fails after
+    the DynamoDB camera record has been written.
+
+    Requirements: 3.14
+    """
+    _dynamodb_client().delete_item(
+        TableName=get_settings().data_table,
+        Key={
+            "PK": {"S": build_tenant_pk(tenant_id)},
+            "SK": {"S": build_camera_sk(site_id, camera_id)},
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# User operations
+# ---------------------------------------------------------------------------
+
+
+def put_user(
+    tenant_id: str,
+    sub: str,
+    email: str,
+    full_name: str,
+    role: str,
+    site_access: list[str],
+) -> None:
+    """Write a User_Record to DynamoDB.
+
+    PK: TENANT#<tenant_id>
+    SK: USER#<sub>
+
+    No ConditionExpression — the sub is unique from Cognito, and
+    re-writes are acceptable (idempotent).
+
+    Requirements: 1.1, 1.2
+    """
+    item: dict[str, Any] = {
+        "PK": {"S": build_tenant_pk(tenant_id)},
+        "SK": {"S": build_user_sk(sub)},
+        "sub": {"S": sub},
+        "email": {"S": email},
+        "full_name": {"S": full_name},
+        "tenant_id": {"S": tenant_id},
+        "role": {"S": role},
+        "site_access": {"L": [{"S": sid} for sid in site_access]},
+    }
+
+    _dynamodb_client().put_item(
+        TableName=get_settings().data_table,
+        Item=item,
+    )
+
+
+def get_users_for_tenant(tenant_id: str) -> list[Mapping[str, Any]]:
+    """Fetch all User_Records for a tenant.
+
+    Queries PK=TENANT#<tenant_id> with SK begins_with USER#.
+    Paginates through all results and returns the complete list.
+
+    Requirements: 2.6
+    """
+    items: list[Mapping[str, Any]] = []
+    kwargs: dict[str, Any] = {
+        "TableName": get_settings().data_table,
+        "KeyConditionExpression": "PK = :pk AND begins_with(SK, :sk_prefix)",
+        "ExpressionAttributeValues": {
+            ":pk": {"S": build_tenant_pk(tenant_id)},
+            ":sk_prefix": {"S": "USER#"},
+        },
+    }
+
+    while True:
+        response = _dynamodb_client().query(**kwargs)
+        items.extend(response.get("Items", []))
+        last_key = response.get("LastEvaluatedKey")
+        if not last_key:
+            break
+        kwargs["ExclusiveStartKey"] = last_key
+
+    return items
+
+
+# ---------------------------------------------------------------------------
+# Snapshot delete operations
+# ---------------------------------------------------------------------------
+
+
+def get_img_record_by_key(tenant_id: str, img_sk: str) -> Mapping[str, Any] | None:
+    """Fetch an IMG# record by its exact PK/SK.
+
+    Returns None if the item does not exist.
+    """
+    response: dict[str, Any] = _dynamodb_client().get_item(
+        TableName=get_settings().data_table,
+        Key={
+            "PK": {"S": build_tenant_pk(tenant_id)},
+            "SK": {"S": img_sk},
+        },
+    )
+    return response.get("Item")
+
+
+def delete_img_record(tenant_id: str, img_sk: str) -> None:
+    """Delete an IMG# record from DynamoDB."""
+    _dynamodb_client().delete_item(
+        TableName=get_settings().data_table,
+        Key={
+            "PK": {"S": build_tenant_pk(tenant_id)},
+            "SK": {"S": img_sk},
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Site ingest hours operations
+# ---------------------------------------------------------------------------
+
+
+def update_site_ingest_hours(
+    tenant_id: str,
+    site_id: str,
+    ingest_hours: dict[str, str] | None,
+) -> None:
+    """Update the ingest_hours attribute on a site record.
+
+    If ingest_hours is None, removes the attribute (all hours allowed).
+    If ingest_hours is a dict with 'start' and 'end', sets the attribute
+    as a Map with S-typed start/end values.
+    """
+    if ingest_hours is None:
+        # Remove the attribute
+        _dynamodb_client().update_item(
+            TableName=get_settings().data_table,
+            Key={
+                "PK": {"S": build_tenant_pk(tenant_id)},
+                "SK": {"S": build_site_sk(site_id)},
+            },
+            UpdateExpression="REMOVE ingest_hours",
+        )
+    else:
+        _dynamodb_client().update_item(
+            TableName=get_settings().data_table,
+            Key={
+                "PK": {"S": build_tenant_pk(tenant_id)},
+                "SK": {"S": build_site_sk(site_id)},
+            },
+            UpdateExpression="SET ingest_hours = :ih",
+            ExpressionAttributeValues={
+                ":ih": {
+                    "M": {
+                        "start": {"S": ingest_hours["start"]},
+                        "end": {"S": ingest_hours["end"]},
+                    }
+                },
+            },
+        )
+
+
+def get_site_ingest_hours(tenant_id: str, site_id: str) -> dict[str, str] | None:
+    """Fetch the ingest_hours config for a site.
+
+    Returns None if no ingest_hours are configured (all hours allowed).
+    Returns {"start": "HH:MM", "end": "HH:MM"} if configured.
+    """
+    site_item = get_site(tenant_id, site_id)
+    if site_item is None:
+        return None
+
+    ingest_hours_attr = site_item.get("ingest_hours")
+    if ingest_hours_attr is None:
+        return None
+
+    # DynamoDB Map type: {"M": {"start": {"S": "07:00"}, "end": {"S": "18:00"}}}
+    m = ingest_hours_attr.get("M")
+    if m is None:
+        return None
+
+    start = m.get("start", {}).get("S")
+    end = m.get("end", {}).get("S")
+
+    if start and end:
+        return {"start": start, "end": end}
+
+    return None

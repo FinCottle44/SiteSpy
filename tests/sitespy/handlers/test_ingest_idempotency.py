@@ -15,7 +15,6 @@ import os
 from datetime import UTC
 from unittest.mock import patch
 
-import bcrypt
 import boto3
 from hypothesis import given, settings
 from hypothesis import strategies as st
@@ -26,6 +25,7 @@ from sitespy.handlers.ingest import _handle
 from sitespy.storage import _s3_client
 
 _ID_ST = st.from_regex(r"^[a-z0-9_]{1,64}$", fullmatch=True)
+_TOKEN_SUFFIX_ST = st.from_regex(r"^[A-Za-z0-9_-]{40}$", fullmatch=True)
 _BODY_ST = st.binary(min_size=4, max_size=512).map(lambda b: b"\xff\xd8\xff\xe0" + b)
 
 _FROZEN_TS = "2025-06-15T14:00:00Z"
@@ -69,15 +69,17 @@ def _setup_aws():
     return s3, ddb
 
 
-def _seed_camera(ddb, tenant_id, site_id, camera_id, username, password):
-    hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt(rounds=12))
+def _seed_camera(ddb, tenant_id, site_id, camera_id, ingest_token):
+    """Write camera and tenant rows to mocked DynamoDB."""
     ddb.put_item(
         TableName="test-data-table",
         Item={
             "PK": {"S": f"TENANT#{tenant_id}"},
             "SK": {"S": f"SITE#{site_id}#CAM#{camera_id}"},
-            "ingest_username": {"S": username},
-            "ingest_password_hash": {"S": hashed.decode()},
+            "GSI1PK": {"S": f"TOKEN#{ingest_token}"},
+            "GSI1SK": {"S": "CAMERA"},
+            "camera_name": {"S": "Test Camera"},
+            "ingest_token": {"S": ingest_token},
         },
     )
     ddb.put_item(
@@ -90,18 +92,16 @@ def _seed_camera(ddb, tenant_id, site_id, camera_id, username, password):
     )
 
 
-def _make_event(tenant_id, site_id, camera_id, body, username, password):
-    credentials = base64.b64encode(f"{username}:{password}".encode()).decode()
+def _make_event(ingest_token, body):
+    """Build an ingest event using token-based URL path auth."""
     return {
         "httpMethod": "POST",
-        "path": "/v1/ingest",
+        "path": f"/v1/ingest/{ingest_token}",
+        "pathParameters": {"token": ingest_token},
         "headers": {
-            "Authorization": f"Basic {credentials}",
-            "X-Tenant-ID": tenant_id,
-            "X-Site-ID": site_id,
             "Content-Type": "image/jpeg",
         },
-        "queryStringParameters": {"cameraID": camera_id},
+        "queryStringParameters": None,
         "body": base64.b64encode(body).decode(),
         "isBase64Encoded": True,
     }
@@ -129,18 +129,19 @@ def _set_env():
     tenant_id=_ID_ST,
     site_id=_ID_ST,
     camera_id=_ID_ST,
+    token_suffix=_TOKEN_SUFFIX_ST,
     body=_BODY_ST,
 )
 @settings(max_examples=10, deadline=None)
-def test_p3_idempotency_same_body_twice(tenant_id, site_id, camera_id, body):
+def test_p3_idempotency_same_body_twice(tenant_id, site_id, camera_id, token_suffix, body):
     """P3: two identical ingests produce exactly one S3 version and one IMG# item."""
     _set_env()
 
+    ingest_token = f"tk_{token_suffix}"
+
     with mock_aws():
         s3, ddb = _setup_aws()
-        username = "sitespy_cam_idem"
-        password = "idempassword"
-        _seed_camera(ddb, tenant_id, site_id, camera_id, username, password)
+        _seed_camera(ddb, tenant_id, site_id, camera_id, ingest_token)
 
         # Clear caches inside the mock context to ensure fresh clients
         from sitespy.config import get_settings as _gs
@@ -151,7 +152,7 @@ def test_p3_idempotency_same_body_twice(tenant_id, site_id, camera_id, body):
         _ddb_client.cache_clear()
         _s3c.cache_clear()
 
-        event = _make_event(tenant_id, site_id, camera_id, body, username, password)
+        event = _make_event(ingest_token, body)
 
         # Freeze the timestamp so both calls produce the same canonical key
         with patch("sitespy.handlers.ingest.datetime") as mock_dt:
