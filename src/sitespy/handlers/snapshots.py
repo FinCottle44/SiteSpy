@@ -235,15 +235,20 @@ def _handle_list(event: dict[str, Any], correlation_id: str) -> dict[str, Any]:
             logger.exception("s3_presign_failed", extra={"s3_key": s3_key})
             raise InternalError() from exc
 
-        images.append(
-            {
-                "timestamp": timestamp,
-                "camera_id": camera_id,
-                "key": s3_key,
-                "presigned_url": presigned_url,
-                "expires_in": _PRESIGNED_TTL,
-            }
-        )
+        image_entry: dict[str, Any] = {
+            "timestamp": timestamp,
+            "camera_id": camera_id,
+            "key": s3_key,
+            "presigned_url": presigned_url,
+            "expires_in": _PRESIGNED_TTL,
+        }
+
+        # Include weather if present on the record
+        weather_attr = item.get("weather")
+        if weather_attr is not None:
+            image_entry["weather"] = _marshal_weather(weather_attr)
+
+        images.append(image_entry)
 
     # --- Build next_cursor ---
     next_cursor: str | None = None
@@ -477,7 +482,7 @@ def _build_single_camera_response(
         logger.exception("s3_presign_failed")
         raise InternalError() from exc
 
-    return {
+    result: dict[str, Any] = {
         "camera_id": camera_id,
         "timestamp": timestamp,
         "key": s3_key,
@@ -485,6 +490,12 @@ def _build_single_camera_response(
         "expires_in": _PRESIGNED_TTL,
         "age_seconds": compute_age_seconds(timestamp),
     }
+
+    weather_attr = img_record.get("weather")
+    if weather_attr is not None:
+        result["weather"] = _marshal_weather(weather_attr)
+
+    return result
 
 
 def _build_camera_entry(
@@ -511,6 +522,7 @@ def _build_camera_entry(
             "presigned_url": None,
             "expires_in": _PRESIGNED_TTL,
             "age_seconds": None,
+            "weather": None,
         }
 
     s3_key: str = img_record.get("s3_key", {}).get("S", "")
@@ -522,7 +534,7 @@ def _build_camera_entry(
         logger.exception("s3_presign_failed", extra={"camera_id": camera_id})
         raise InternalError() from exc
 
-    return {
+    result: dict[str, Any] = {
         "camera_id": camera_id,
         "camera_name": camera_name,
         "timestamp": timestamp,
@@ -530,6 +542,14 @@ def _build_camera_entry(
         "expires_in": _PRESIGNED_TTL,
         "age_seconds": compute_age_seconds(timestamp),
     }
+
+    weather_attr = img_record.get("weather")
+    if weather_attr is not None:
+        result["weather"] = _marshal_weather(weather_attr)
+    else:
+        result["weather"] = None
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -638,6 +658,42 @@ def _fetch_site_or_404(tenant_id: str, site_id: str) -> Mapping[str, Any]:
         raise NotFound()
 
     return site_item
+
+
+# ---------------------------------------------------------------------------
+# Weather marshalling
+# ---------------------------------------------------------------------------
+
+
+def _marshal_weather(weather_attr: dict[str, Any]) -> dict[str, Any] | None:
+    """Convert a DynamoDB weather map attribute to a plain JSON-friendly dict.
+
+    The weather attribute in DynamoDB is stored as:
+      {"M": {"condition": {"S": "Rain"}, "temp_c": {"N": "14.2"}, ...}}
+
+    Returns a flat dict like:
+      {"condition": "Rain", "temp_c": 14.2, ...}
+
+    Returns None if the attribute is malformed.
+    """
+    m = weather_attr.get("M")
+    if not m:
+        return None
+
+    try:
+        return {
+            "condition": m.get("condition", {}).get("S", "Unknown"),
+            "description": m.get("description", {}).get("S", ""),
+            "temp_c": float(m.get("temp_c", {}).get("N", "0")),
+            "feels_like_c": float(m.get("feels_like_c", {}).get("N", "0")),
+            "humidity_pct": int(m.get("humidity_pct", {}).get("N", "0")),
+            "wind_speed_ms": float(m.get("wind_speed_ms", {}).get("N", "0")),
+            "wind_deg": int(m.get("wind_deg", {}).get("N", "0")),
+            "visibility_m": int(m.get("visibility_m", {}).get("N", "0")),
+            "cloud_pct": int(m.get("cloud_pct", {}).get("N", "0")),
+        }
+    except (ValueError, TypeError, AttributeError):
+        return None
 
 
 # ---------------------------------------------------------------------------

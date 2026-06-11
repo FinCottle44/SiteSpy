@@ -1,6 +1,6 @@
 """S3 storage helpers for SiteSpy — canonical key construction and snapshot writes.
 
-Requirements validated: 5.2, 5.3, 5.4, 5.5, 5.6, 5.8
+Requirements validated: 5.2, 5.3, 5.4, 5.5, 5.6, 5.8, 6.1
 """
 
 from __future__ import annotations
@@ -130,4 +130,61 @@ def put_snapshot(
         ContentType="image/jpeg",
         Metadata={"sha256": sha256_hex, "ingested-at": snapshot_ts},
         Tagging=f"tenant_id={tenant_id}&retention_years={retention_years}",
+    )
+
+
+def build_live_snapshot_key(
+    tenant_id: str,
+    site_id: str,
+    camera_id: str,
+    snapshot_ts: str,
+) -> str:
+    """Build the canonical S3 key for a live-view snapshot.
+
+    Key format: live/<tenant_id>/<site_id>/<camera_id>/<snapshot_ts>.jpg
+
+    Unlike timelapse keys there are no date-component sub-directories; objects are
+    short-lived and cleaned up by the S3 Lifecycle rule on the ``live/`` prefix.
+
+    Args:
+        tenant_id:   Tenant identifier.
+        site_id:     Site identifier.
+        camera_id:   Camera identifier.
+        snapshot_ts: UTC timestamp in YYYY-MM-DDTHH:mm:ssZ format.
+
+    Returns:
+        The canonical S3 object key string for the live snapshot.
+    """
+    return f"live/{tenant_id}/{site_id}/{camera_id}/{snapshot_ts}.jpg"
+
+
+def put_live_snapshot(
+    key: str,
+    body: bytes,
+    sha256_hex: str,
+    snapshot_ts: str,
+    tenant_id: str,
+) -> None:
+    """Write a live-view JPEG snapshot to S3 with integrity metadata.
+
+    No retention tag is applied — cleanup is handled exclusively by the S3
+    Lifecycle rule that expires objects under the ``live/`` prefix after 1 day.
+
+    Args:
+        key:         Canonical S3 object key (from build_live_snapshot_key).
+        body:        Raw JPEG bytes.
+        sha256_hex:  Lowercase hex SHA-256 digest of body.
+        snapshot_ts: UTC timestamp (YYYY-MM-DDTHH:mm:ssZ).
+        tenant_id:   Tenant identifier (stored in object metadata for traceability).
+    """
+    _s3_client().put_object(
+        Bucket=get_settings().snapshots_bucket,
+        Key=key,
+        Body=body,
+        ContentType="image/jpeg",
+        Metadata={
+            "sha256": sha256_hex,
+            "captured-at": snapshot_ts,
+            "tenant-id": tenant_id,
+        },
     )

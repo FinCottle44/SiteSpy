@@ -37,6 +37,12 @@ Parameters:
     Description: ACM certificate ARN for the custom domain (prod only, must be in same region).
     Default: ""
 
+  OpenWeatherApiKey:
+    Type: String
+    Description: OpenWeather API key for attaching weather data to timelapse snapshots.
+    Default: ""
+    NoEcho: true
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Conditions
 # ─────────────────────────────────────────────────────────────────────────────
@@ -106,6 +112,10 @@ Resources:
             Status: Enabled
             AbortIncompleteMultipartUpload:
               DaysAfterInitiation: 7
+          - Id: ExpireLiveSnapshotsAfter1Hour
+            Prefix: live/
+            Status: Enabled
+            ExpirationInDays: 1
       CorsConfiguration:
         CorsRules:
           - AllowedOrigins: ["*"]
@@ -151,6 +161,9 @@ Resources:
               KeyType: RANGE
           Projection:
             ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
       Tags:
         - Key: Project
           Value: SiteSpy
@@ -175,7 +188,7 @@ Resources:
           DataTraceEnabled: false
           MetricsEnabled: true
       Cors:
-        AllowMethods: "'GET,POST,PATCH,DELETE,OPTIONS'"
+        AllowMethods: "'GET,POST,PUT,PATCH,DELETE,OPTIONS'"
         AllowHeaders: "'Content-Type,Authorization,X-Correlation-Id'"
         AllowOrigin: "'*'"
       GatewayResponses:
@@ -184,13 +197,13 @@ Resources:
             Headers:
               Access-Control-Allow-Origin: "'*'"
               Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Correlation-Id'"
-              Access-Control-Allow-Methods: "'GET,POST,PATCH,DELETE,OPTIONS'"
+              Access-Control-Allow-Methods: "'GET,POST,PUT,PATCH,DELETE,OPTIONS'"
         DEFAULT_5XX:
           ResponseParameters:
             Headers:
               Access-Control-Allow-Origin: "'*'"
               Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Correlation-Id'"
-              Access-Control-Allow-Methods: "'GET,POST,PATCH,DELETE,OPTIONS'"
+              Access-Control-Allow-Methods: "'GET,POST,PUT,PATCH,DELETE,OPTIONS'"
       Auth:
         DefaultAuthorizer: CognitoAuthorizer
         AddDefaultAuthorizerToCorsPreflight: false
@@ -383,6 +396,52 @@ Resources:
             Path: /v1/tenants
             Method: POST
 
+  # ── Tenants Logo Lambda ────────────────────────────────────────────────────
+  TenantsLogoFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub sitespy-${Environment}-tenants-logo
+      CodeUri: src/
+      Handler: sitespy.handlers.tenants_logo.handler
+      Description: Uploads or replaces a tenant company logo (super admin only).
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DataTable
+        - Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub "arn:aws:s3:::${SnapshotsBucket}/logos/*"
+      Events:
+        PutTenantLogo:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SiteSpyApi
+            Path: /v1/tenants/{tenant_id}/logo
+            Method: PUT
+
+  # ── Tenants Logo GET Lambda ──────────────────────────────────────────────────
+  TenantsLogoGetFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub sitespy-${Environment}-tenants-logo-get
+      CodeUri: src/
+      Handler: sitespy.handlers.tenants_logo.handler_get
+      Description: Returns a presigned URL for a tenant logo (any authenticated user).
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref DataTable
+        - Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub "arn:aws:s3:::${SnapshotsBucket}/logos/*"
+      Events:
+        GetTenantLogo:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SiteSpyApi
+            Path: /v1/tenants/{tenant_id}/logo
+            Method: GET
+
   # ── Sites POST Lambda ──────────────────────────────────────────────────────
   SitesPostFunction:
     Type: AWS::Serverless::Function
@@ -571,6 +630,42 @@ Resources:
             Path: /v1/snapshots
             Method: DELETE
 
+  # ── Live Session Lambda ─────────────────────────────────────────────────────
+  LiveSessionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub sitespy-${Environment}-live-session
+      CodeUri: src/
+      Handler: sitespy.handlers.live_session.handler
+      Description: Manages live view sessions (POST/GET/DELETE).
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DataTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+              Resource: !Sub "arn:aws:s3:::${SnapshotsBucket}/*"
+      Events:
+        PostLiveSession:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SiteSpyApi
+            Path: /v1/sites/{site_id}/cameras/{camera_id}/live-session
+            Method: POST
+        GetLiveSession:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SiteSpyApi
+            Path: /v1/sites/{site_id}/cameras/{camera_id}/live-session
+            Method: GET
+        DeleteLiveSession:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SiteSpyApi
+            Path: /v1/sites/{site_id}/cameras/{camera_id}/live-session
+            Method: DELETE
+
   # ── Ingest Lambda ─────────────────────────────────────────────────────────
   IngestFunction:
     Type: AWS::Serverless::Function
@@ -581,6 +676,9 @@ Resources:
       Description: Receives JPEG snapshots from Axis cameras over HTTP Basic Auth.
       Timeout: 30
       MemorySize: 1024
+      Environment:
+        Variables:
+          OPENWEATHER_API_KEY: !Ref OpenWeatherApiKey
       Policies:
         - Statement:
             - Effect: Allow

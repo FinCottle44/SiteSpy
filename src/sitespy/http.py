@@ -19,7 +19,7 @@ _CONTENT_TYPE = "application/json"
 _CORS_HEADERS = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Headers": "Content-Type,Authorization,X-Correlation-Id",
-    "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS",
+    "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
 }
 
 

@@ -12,7 +12,7 @@ import hashlib
 import re
 import time
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from aws_lambda_powertools import Logger, Metrics
@@ -21,6 +21,7 @@ from aws_lambda_powertools.metrics import MetricUnit
 from sitespy import data, storage
 from sitespy.errors import ApiError, BadRequest, InternalError, Unauthorized
 from sitespy.http import error_response, json_response, unhandled_error_response
+from sitespy.weather import fetch_current_weather, weather_to_dynamo_map
 
 # ---------------------------------------------------------------------------
 # Powertools setup
@@ -38,6 +39,7 @@ _TOKEN_RE = re.compile(r"^tk_[A-Za-z0-9_-]{20,80}$")
 _MAX_BODY_BYTES = 10 * 1024 * 1024  # 10 MiB
 _JPEG_MAGIC = b"\xff\xd8\xff"
 _ROUTE = "POST /v1/ingest/{token}"
+_CADENCE_MINUTES = 15
 
 
 # ---------------------------------------------------------------------------
@@ -205,43 +207,192 @@ def _handle(event: dict[str, Any], correlation_id: str) -> dict[str, Any]:
             correlation_id,
         )
 
-    # --- Hash, key, S3 write, DynamoDB write ---
+    # --- Cadence check ---
+    # Enforce a minimum 15-minute gap between saved timelapse snapshots.
+    # Fail open: if DynamoDB read errors, treat as no prior record.
+    save_timelapse = True
+    try:
+        latest_img = data.get_latest_img_record(tenant_id, site_id, camera_id)
+        if latest_img is not None:
+            ingested_at_str = latest_img.get("ingested_at", {}).get("S", "")
+            if ingested_at_str:
+                ingested_at_dt = datetime.fromisoformat(
+                    ingested_at_str.replace("Z", "+00:00")
+                )
+                now_utc = datetime.now(tz=UTC)
+                if (now_utc - ingested_at_dt) < timedelta(minutes=_CADENCE_MINUTES):
+                    save_timelapse = False
+    except Exception:
+        logger.exception(
+            "cadence_check_dynamo_error",
+            extra={
+                "tenant_id": tenant_id,
+                "site_id": site_id,
+                "camera_id": camera_id,
+                "correlation_id": correlation_id,
+            },
+        )
+        save_timelapse = True
+
+    # --- Live session check ---
+    # Check if an active live session exists for this camera.
+    # Fail open (save_live = False) on DynamoDB error per requirement 5.8.
+    save_live = False
+    try:
+        session_record = data.get_live_session(tenant_id, site_id, camera_id)
+        if session_record is not None:
+            expires_at_str = session_record.get("expires_at", {}).get("S", "")
+            if expires_at_str:
+                expires_at_dt = datetime.fromisoformat(
+                    expires_at_str.replace("Z", "+00:00")
+                )
+                now_utc = datetime.now(tz=UTC)
+                if expires_at_dt > now_utc:
+                    save_live = True
+    except Exception:
+        logger.exception(
+            "live_session_check_dynamo_error",
+            extra={
+                "tenant_id": tenant_id,
+                "site_id": site_id,
+                "camera_id": camera_id,
+                "correlation_id": correlation_id,
+            },
+        )
+        save_live = False
+
+    # --- If cadence suppresses timelapse and no live session, return early ---
+    if not save_timelapse and not save_live:
+        logger.info(
+            "ingest_skipped_cadence_filter",
+            extra={
+                "tenant_id": tenant_id,
+                "site_id": site_id,
+                "camera_id": camera_id,
+                "correlation_id": correlation_id,
+            },
+        )
+        return json_response(
+            200,
+            {
+                "status": "skipped",
+                "reason": "cadence_filter",
+                "camera_id": camera_id,
+                "live_captured": False,
+            },
+            correlation_id,
+        )
+
+    # --- Hash and timestamp ---
     snapshot_ts = datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     sha256_hex = hashlib.sha256(body).hexdigest()
-    key = storage.build_snapshot_key(tenant_id, site_id, camera_id, snapshot_ts)
-    retention_years = data.get_retention_years(tenant_id)
 
-    try:
-        storage.put_snapshot(key, body, sha256_hex, snapshot_ts, tenant_id, retention_years)
-    except Exception as exc:
-        logger.exception("s3_put_snapshot_failed")
-        raise InternalError("An internal error occurred.") from exc
+    # --- Timelapse write (existing code path) ---
+    key = ""
+    if save_timelapse:
+        key = storage.build_snapshot_key(tenant_id, site_id, camera_id, snapshot_ts)
+        retention_years = data.get_retention_years(tenant_id)
 
-    try:
-        data.put_img_record(
-            tenant_id=tenant_id,
-            site_id=site_id,
-            camera_id=camera_id,
-            snapshot_ts=snapshot_ts,
-            s3_key=key,
-            sha256_hex=sha256_hex,
-            size_bytes=len(body),
+        # --- Fetch weather for timelapse snapshots only (fail open) ---
+        weather_map = None
+        try:
+            site_item = data.get_site(tenant_id, site_id)
+            if site_item:
+                lat_val = site_item.get("latitude", {}).get("N")
+                lon_val = site_item.get("longitude", {}).get("N")
+                if lat_val and lon_val:
+                    weather = fetch_current_weather(float(lat_val), float(lon_val))
+                    if weather:
+                        weather_map = weather_to_dynamo_map(weather)
+        except Exception:
+            logger.warning(
+                "weather_fetch_failed",
+                extra={
+                    "tenant_id": tenant_id,
+                    "site_id": site_id,
+                    "camera_id": camera_id,
+                    "correlation_id": correlation_id,
+                },
+            )
+
+        try:
+            storage.put_snapshot(key, body, sha256_hex, snapshot_ts, tenant_id, retention_years)
+        except Exception as exc:
+            logger.exception("s3_put_snapshot_failed")
+            raise InternalError("An internal error occurred.") from exc
+
+        try:
+            data.put_img_record(
+                tenant_id=tenant_id,
+                site_id=site_id,
+                camera_id=camera_id,
+                snapshot_ts=snapshot_ts,
+                s3_key=key,
+                sha256_hex=sha256_hex,
+                size_bytes=len(body),
+                weather=weather_map,
+            )
+        except Exception as exc:
+            logger.exception("dynamodb_put_img_record_failed")
+            raise InternalError("An internal error occurred.") from exc
+
+    # --- Live write ---
+    live_captured = False
+    if save_live:
+        live_key = storage.build_live_snapshot_key(tenant_id, site_id, camera_id, snapshot_ts)
+        live_ttl = int(
+            datetime.fromisoformat(snapshot_ts.replace("Z", "+00:00")).timestamp()
+        ) + 3600
+
+        try:
+            storage.put_live_snapshot(live_key, body, sha256_hex, snapshot_ts, tenant_id)
+        except Exception as exc:
+            logger.exception("s3_put_live_snapshot_failed")
+            raise InternalError("An internal error occurred.") from exc
+
+        try:
+            data.put_live_img_record(
+                tenant_id=tenant_id,
+                site_id=site_id,
+                camera_id=camera_id,
+                snapshot_ts=snapshot_ts,
+                s3_key=live_key,
+                sha256_hex=sha256_hex,
+                size_bytes=len(body),
+                ttl=live_ttl,
+            )
+        except Exception as exc:
+            logger.exception("dynamodb_put_live_img_record_failed")
+            raise InternalError("An internal error occurred.") from exc
+
+        live_captured = True
+
+    # --- Build response ---
+    if save_timelapse:
+        return json_response(
+            201,
+            {
+                "key": key,
+                "timestamp": snapshot_ts,
+                "camera_id": camera_id,
+                "sha256": sha256_hex,
+                "size_bytes": len(body),
+                "live_captured": live_captured,
+            },
+            correlation_id,
         )
-    except Exception as exc:
-        logger.exception("dynamodb_put_img_record_failed")
-        raise InternalError("An internal error occurred.") from exc
-
-    return json_response(
-        201,
-        {
-            "key": key,
-            "timestamp": snapshot_ts,
-            "camera_id": camera_id,
-            "sha256": sha256_hex,
-            "size_bytes": len(body),
-        },
-        correlation_id,
-    )
+    else:
+        # Only live write occurred — cadence suppressed timelapse
+        return json_response(
+            200,
+            {
+                "status": "skipped",
+                "reason": "cadence_filter",
+                "camera_id": camera_id,
+                "live_captured": live_captured,
+            },
+            correlation_id,
+        )
 
 
 # ---------------------------------------------------------------------------

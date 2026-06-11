@@ -17,7 +17,7 @@ capabilities = "CAPABILITY_IAM"
 confirm_changeset = true
 resolve_s3 = true
 fail_on_empty_changeset = false
-parameter_overrides = "Environment=dev LogLevel=INFO"
+parameter_overrides = "Environment=dev LogLevel=INFO OpenWeatherApiKey=***REMOVED***"
 tags = "Project=SiteSpy Environment=dev"
 
 [dev.sync.parameters]
@@ -44,5 +44,5 @@ capabilities = "CAPABILITY_IAM"
 confirm_changeset = true
 resolve_s3 = true
 fail_on_empty_changeset = false
-parameter_overrides = "Environment=prod LogLevel=INFO DomainName=api.sitespy.io CertificateArn=arn:aws:acm:eu-west-2:378202224921:certificate/3abfe13e-8227-4bdd-b479-6bc62950df69 CognitoUserPoolId=eu-west-2_XXwnO0sjc CognitoUserPoolClientId=eu-west-2_XXwnO0sjc"
+parameter_overrides = "Environment=prod LogLevel=INFO DomainName=api.sitespy.io CertificateArn=arn:aws:acm:eu-west-2:378202224921:certificate/3abfe13e-8227-4bdd-b479-6bc62950df69 CognitoUserPoolId=eu-west-2_XXwnO0sjc CognitoUserPoolClientId=eu-west-2_XXwnO0sjc OpenWeatherApiKey=***REMOVED***"
 tags = "Project=SiteSpy Environment=prod"

@@ -186,3 +186,93 @@ def test_put_snapshot_retries_on_transient_failure():
     source = inspect.getsource(storage_module)
     assert '"mode": "standard"' in source or "'mode': 'standard'" in source
     assert '"max_attempts": 3' in source or "'max_attempts': 3" in source
+
+
+# ===========================================================================
+# build_live_snapshot_key unit tests
+# Requirements validated: 5.2
+# ===========================================================================
+from sitespy.storage import build_live_snapshot_key, put_live_snapshot
+
+
+class TestBuildLiveSnapshotKey:
+    """Tests for build_live_snapshot_key key format."""
+
+    def test_produces_correct_key_format(self):
+        """build_live_snapshot_key produces live/<tenant>/<site>/<cam>/<ts>.jpg."""
+        result = build_live_snapshot_key(
+            tenant_id="acme",
+            site_id="site_01",
+            camera_id="cam_01",
+            snapshot_ts="2025-06-15T14:00:00Z",
+        )
+        assert result == "live/acme/site_01/cam_01/2025-06-15T14:00:00Z.jpg"
+
+    def test_key_starts_with_live_prefix(self):
+        """Key always starts with 'live/' prefix."""
+        result = build_live_snapshot_key("tenant_x", "s1", "c1", "2025-01-01T00:00:00Z")
+        assert result.startswith("live/")
+
+    def test_key_ends_with_jpg_extension(self):
+        """Key always ends with '.jpg' extension."""
+        result = build_live_snapshot_key("t1", "s1", "c1", "2025-06-10T12:30:00Z")
+        assert result.endswith(".jpg")
+
+    def test_no_date_subdirectories(self):
+        """Live keys have no date sub-directories unlike timelapse keys."""
+        result = build_live_snapshot_key(
+            "acme", "site_01", "cam_01", "2025-06-15T14:00:00Z"
+        )
+        # Should be exactly 5 path segments: live, tenant, site, cam, filename
+        parts = result.split("/")
+        assert len(parts) == 5
+
+
+# ===========================================================================
+# put_live_snapshot unit tests
+# Requirements validated: 5.2
+# ===========================================================================
+
+
+class TestPutLiveSnapshot:
+    """Tests for put_live_snapshot — no retention tag applied."""
+
+    @mock_aws
+    def test_put_live_snapshot_no_retention_tag(self):
+        """put_live_snapshot does not include a retention tag on the S3 object."""
+        os.environ.setdefault("SNAPSHOTS_BUCKET", "test-snapshots-bucket")
+        os.environ.setdefault("AWS_REGION", "eu-west-2")
+        _s3_client.cache_clear()
+
+        client = boto3.client("s3", region_name="eu-west-2")
+        _create_bucket(client)
+
+        key = "live/acme/site_01/cam_01/2025-06-15T14:00:00Z.jpg"
+        body = b"\xff\xd8\xff\xe0" + b"\x00" * 100
+        sha256_hex = "abc123def456"
+        snapshot_ts = "2025-06-15T14:00:00Z"
+
+        put_live_snapshot(key, body, sha256_hex, snapshot_ts, "acme")
+
+        tag_response = client.get_object_tagging(
+            Bucket="test-snapshots-bucket", Key=key
+        )
+        assert tag_response["TagSet"] == []
+
+    @mock_aws
+    def test_put_live_snapshot_content_type(self):
+        """put_live_snapshot sets ContentType to image/jpeg."""
+        os.environ.setdefault("SNAPSHOTS_BUCKET", "test-snapshots-bucket")
+        os.environ.setdefault("AWS_REGION", "eu-west-2")
+        _s3_client.cache_clear()
+
+        client = boto3.client("s3", region_name="eu-west-2")
+        _create_bucket(client)
+
+        key = "live/acme/site_01/cam_01/2025-06-15T14:00:00Z.jpg"
+        body = b"\xff\xd8\xff\xe0" + b"\x00" * 100
+
+        put_live_snapshot(key, body, "abc123", "2025-06-15T14:00:00Z", "acme")
+
+        response = client.head_object(Bucket="test-snapshots-bucket", Key=key)
+        assert response["ContentType"] == "image/jpeg"

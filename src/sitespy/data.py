@@ -1,6 +1,7 @@
 """DynamoDB helpers for SiteSpy — key builders and table operations.
 
-Requirements validated: 1.1, 1.9, 2.3, 2.12, 2.13, 3.11, 3.12, 3.14, 5.6, 6.1, 6.2, 7.2, 7.5, 7.6, 8.1, 8.2, 8.3, 8.4, 8.5
+Requirements validated: 1.1, 1.9, 2.3, 2.12, 2.13, 3.11, 3.12, 3.14, 5.6, 6.1, 6.2, 7.2, 7.5, 7.6, 8.1, 8.2, 8.3, 8.4, 8.5,
+                       live-view: 2.1, 2.4, 2.5, 2.6, 2.11, 2.13, 4.1, 6.2, 6.4, 6.5
 """
 
 from __future__ import annotations
@@ -90,6 +91,25 @@ def list_tenants() -> list[Mapping[str, Any]]:
         kwargs["ExclusiveStartKey"] = last_key
 
     return items
+
+
+def update_tenant_logo(tenant_id: str, logo_url: str) -> None:
+    """Update the logo_url attribute on a tenant record.
+
+    Sets logo_url = <logo_url> on the tenant item identified by
+    (TENANT#<tenant_id>, TENANT#<tenant_id>).
+    """
+    _dynamodb_client().update_item(
+        TableName=get_settings().data_table,
+        Key={
+            "PK": {"S": build_tenant_pk(tenant_id)},
+            "SK": {"S": build_tenant_sk(tenant_id)},
+        },
+        UpdateExpression="SET logo_url = :logo_url",
+        ExpressionAttributeValues={
+            ":logo_url": {"S": logo_url},
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -564,24 +584,32 @@ def put_img_record(
     s3_key: str,
     sha256_hex: str,
     size_bytes: int,
+    weather: dict[str, dict[str, str]] | None = None,
 ) -> None:
     """Write an IMG# record to DynamoDB (unconditional PutItem).
 
     No ConditionExpression — duplicates overwrite (idempotent, P3).
 
+    Args:
+        weather: Optional DynamoDB map attribute (from weather_to_dynamo_map).
+
     Requirements: 6.1, 6.2, 7.2
     """
+    item: dict[str, Any] = {
+        "PK": {"S": build_tenant_pk(tenant_id)},
+        "SK": {"S": build_img_sk(site_id, camera_id, snapshot_ts)},
+        "s3_key": {"S": s3_key},
+        "sha256": {"S": sha256_hex},
+        "size_bytes": {"N": str(size_bytes)},
+        "ingested_at": {"S": snapshot_ts},
+        "content_type": {"S": "image/jpeg"},
+    }
+    if weather is not None:
+        item["weather"] = weather
+
     _dynamodb_client().put_item(
         TableName=get_settings().data_table,
-        Item={
-            "PK": {"S": build_tenant_pk(tenant_id)},
-            "SK": {"S": build_img_sk(site_id, camera_id, snapshot_ts)},
-            "s3_key": {"S": s3_key},
-            "sha256": {"S": sha256_hex},
-            "size_bytes": {"N": str(size_bytes)},
-            "ingested_at": {"S": snapshot_ts},
-            "content_type": {"S": "image/jpeg"},
-        },
+        Item=item,
     )
 
 
@@ -903,6 +931,94 @@ def delete_img_record(tenant_id: str, img_sk: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Site update operations
+# ---------------------------------------------------------------------------
+
+
+def update_site(
+    tenant_id: str,
+    site_id: str,
+    updates: dict[str, Any],
+) -> None:
+    """Update one or more attributes on a site record.
+
+    Supported fields: ingest_hours, latitude, longitude, timezone.
+    Builds a dynamic UpdateExpression based on which fields are present.
+    """
+    # Handle ingest_hours separately (it has remove logic)
+    if "ingest_hours" in updates and updates["ingest_hours"] is None:
+        # Remove ingest_hours, then process remaining fields
+        remaining = {k: v for k, v in updates.items() if k != "ingest_hours"}
+        if remaining:
+            # Build SET + REMOVE in one call
+            set_parts: list[str] = []
+            attr_values: dict[str, Any] = {}
+            for key, value in remaining.items():
+                placeholder = f":val_{key}"
+                set_parts.append(f"{key} = {placeholder}")
+                attr_values[placeholder] = _to_dynamo_value(key, value)
+
+            _dynamodb_client().update_item(
+                TableName=get_settings().data_table,
+                Key={
+                    "PK": {"S": build_tenant_pk(tenant_id)},
+                    "SK": {"S": build_site_sk(site_id)},
+                },
+                UpdateExpression=f"SET {', '.join(set_parts)} REMOVE ingest_hours",
+                ExpressionAttributeValues=attr_values,
+            )
+        else:
+            _dynamodb_client().update_item(
+                TableName=get_settings().data_table,
+                Key={
+                    "PK": {"S": build_tenant_pk(tenant_id)},
+                    "SK": {"S": build_site_sk(site_id)},
+                },
+                UpdateExpression="REMOVE ingest_hours",
+            )
+        return
+
+    # All fields are SET operations
+    set_parts = []
+    attr_values: dict[str, Any] = {}
+
+    for key, value in updates.items():
+        placeholder = f":val_{key}"
+        set_parts.append(f"{key} = {placeholder}")
+        attr_values[placeholder] = _to_dynamo_value(key, value)
+
+    if not set_parts:
+        return
+
+    _dynamodb_client().update_item(
+        TableName=get_settings().data_table,
+        Key={
+            "PK": {"S": build_tenant_pk(tenant_id)},
+            "SK": {"S": build_site_sk(site_id)},
+        },
+        UpdateExpression=f"SET {', '.join(set_parts)}",
+        ExpressionAttributeValues=attr_values,
+    )
+
+
+def _to_dynamo_value(key: str, value: Any) -> dict[str, Any]:
+    """Convert a Python value to its DynamoDB attribute representation."""
+    if key == "ingest_hours" and isinstance(value, dict):
+        return {
+            "M": {
+                "start": {"S": value["start"]},
+                "end": {"S": value["end"]},
+            }
+        }
+    if key in ("latitude", "longitude"):
+        return {"N": str(value)}
+    if key == "timezone":
+        return {"S": value}
+    # Fallback: treat as string
+    return {"S": str(value)}
+
+
+# ---------------------------------------------------------------------------
 # Site ingest hours operations
 # ---------------------------------------------------------------------------
 
@@ -973,3 +1089,174 @@ def get_site_ingest_hours(tenant_id: str, site_id: str) -> dict[str, str] | None
         return {"start": start, "end": end}
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# Live view session operations (SESSION# records)
+# ---------------------------------------------------------------------------
+
+
+def build_session_sk(site_id: str, camera_id: str) -> str:
+    """Build the DynamoDB sort key for a SESSION# record.
+
+    Requirements (live-view): 2.1, 2.13
+    """
+    return f"SESSION#{site_id}#{camera_id}"
+
+
+def get_live_session(
+    tenant_id: str,
+    site_id: str,
+    camera_id: str,
+) -> Mapping[str, Any] | None:
+    """Fetch the SESSION# record for a camera.
+
+    Single GetItem keyed by (TENANT#<tenant_id>, SESSION#<site_id>#<camera_id>).
+    Returns None if the item does not exist.
+
+    Requirements (live-view): 2.4, 2.6, 4.1, 6.2, 6.4
+    """
+    response: dict[str, Any] = _dynamodb_client().get_item(
+        TableName=get_settings().data_table,
+        Key={
+            "PK": {"S": build_tenant_pk(tenant_id)},
+            "SK": {"S": build_session_sk(site_id, camera_id)},
+        },
+    )
+    return response.get("Item")
+
+
+def put_live_session(
+    tenant_id: str,
+    site_id: str,
+    camera_id: str,
+    session_id: str,
+    expires_at: str,
+    ttl: int,
+    created_by: str,
+    created_at: str,
+) -> None:
+    """Write a SESSION# record to DynamoDB with duplicate prevention.
+
+    Uses ConditionExpression attribute_not_exists(SK) so that a second
+    concurrent POST for the same camera raises ConditionalCheckFailedException
+    rather than silently overwriting an active session.
+
+    Requirements (live-view): 2.1, 2.4, 2.5, 2.11, 2.13, 6.2, 6.5
+    """
+    _dynamodb_client().put_item(
+        TableName=get_settings().data_table,
+        Item={
+            "PK": {"S": build_tenant_pk(tenant_id)},
+            "SK": {"S": build_session_sk(site_id, camera_id)},
+            "session_id": {"S": session_id},
+            "expires_at": {"S": expires_at},
+            "ttl": {"N": str(ttl)},
+            "created_by": {"S": created_by},
+            "created_at": {"S": created_at},
+        },
+        ConditionExpression="attribute_not_exists(SK)",
+    )
+
+
+def delete_live_session(tenant_id: str, site_id: str, camera_id: str) -> None:
+    """Delete the SESSION# record for a camera.
+
+    DeleteItem by (TENANT#<tenant_id>, SESSION#<site_id>#<camera_id>).
+    No-ops silently if the item does not exist.
+
+    Requirements (live-view): 4.1, 6.4
+    """
+    _dynamodb_client().delete_item(
+        TableName=get_settings().data_table,
+        Key={
+            "PK": {"S": build_tenant_pk(tenant_id)},
+            "SK": {"S": build_session_sk(site_id, camera_id)},
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# LIVE_IMG# key builder and record operations  (live-view-session feature)
+# ---------------------------------------------------------------------------
+
+
+def build_live_img_sk(site_id: str, camera_id: str, snapshot_ts: str) -> str:
+    """Build the DynamoDB sort key for a LIVE_IMG# record.
+
+    Returns: ``LIVE_IMG#<site_id>#<camera_id>#<snapshot_ts>``
+
+    Requirements (live-view): 3.1, 5.6, 6.4
+    """
+    return f"LIVE_IMG#{site_id}#{camera_id}#{snapshot_ts}"
+
+
+def get_latest_live_img_record(
+    tenant_id: str,
+    site_id: str,
+    camera_id: str,
+) -> Mapping[str, Any] | None:
+    """Fetch the most recent LIVE_IMG# record for a camera.
+
+    Queries ``PK=TENANT#<tenant_id>`` with ``SK begins_with LIVE_IMG#<site_id>#<camera_id>#``,
+    sorted descending, limit 1.  Returns ``None`` if no records exist.
+
+    Requirements (live-view): 3.1, 5.6, 6.4
+    """
+    sk_prefix = f"LIVE_IMG#{site_id}#{camera_id}#"
+    response: dict[str, Any] = _dynamodb_client().query(
+        TableName=get_settings().data_table,
+        KeyConditionExpression="PK = :pk AND begins_with(SK, :sk_prefix)",
+        ExpressionAttributeValues={
+            ":pk": {"S": build_tenant_pk(tenant_id)},
+            ":sk_prefix": {"S": sk_prefix},
+        },
+        ScanIndexForward=False,
+        Limit=1,
+    )
+    items = response.get("Items", [])
+    return items[0] if items else None
+
+
+def put_live_img_record(
+    tenant_id: str,
+    site_id: str,
+    camera_id: str,
+    snapshot_ts: str,
+    s3_key: str,
+    sha256_hex: str,
+    size_bytes: int,
+    ttl: int,
+) -> None:
+    """Write a LIVE_IMG# record to DynamoDB (unconditional PutItem).
+
+    Record schema:
+
+    +--------------+-------+-------------------------------------------+
+    | Attribute    | Type  | Value                                     |
+    +==============+=======+===========================================+
+    | PK           | S     | TENANT#<tenant_id>                        |
+    | SK           | S     | LIVE_IMG#<site_id>#<camera_id>#<ts>       |
+    | s3_key       | S     | live/<tenant>/<site>/<cam>/<ts>.jpg       |
+    | sha256       | S     | hex SHA-256 of the JPEG body              |
+    | size_bytes   | N     | byte length of the JPEG body              |
+    | captured_at  | S     | ISO 8601 UTC timestamp (<snapshot_ts>)    |
+    | ttl          | N     | Unix epoch of captured_at + 3600          |
+    +--------------+-------+-------------------------------------------+
+
+    No ConditionExpression — concurrent live writes overwrite (idempotent).
+
+    Requirements (live-view): 3.1, 5.6, 6.4
+    """
+    _dynamodb_client().put_item(
+        TableName=get_settings().data_table,
+        Item={
+            "PK": {"S": build_tenant_pk(tenant_id)},
+            "SK": {"S": build_live_img_sk(site_id, camera_id, snapshot_ts)},
+            "s3_key": {"S": s3_key},
+            "sha256": {"S": sha256_hex},
+            "size_bytes": {"N": str(size_bytes)},
+            "captured_at": {"S": snapshot_ts},
+            "ttl": {"N": str(ttl)},
+        },
+    )

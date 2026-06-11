@@ -448,7 +448,7 @@ Exceeding limits returns `429` with a `Retry-After` header. Implement exponentia
 ## CORS
 
 The API allows:
-- Methods: `GET, POST, PATCH, DELETE, OPTIONS`
+- Methods: `GET, POST, PUT, PATCH, DELETE, OPTIONS`
 - Headers: `Content-Type, Authorization, X-Correlation-Id`
 - Origin: `*` (any origin allowed)
 
@@ -859,6 +859,81 @@ Updates site configuration. Currently supports setting ingest hours. **Tenant ad
 - 400 — invalid time format, start equals end, missing fields
 - 403 — caller is a regular user
 - 404 — site does not exist
+
+---
+
+### PUT /v1/tenants/{tenant_id}/logo
+
+Uploads or replaces a tenant's company logo. **Super admin only.**
+
+**Content-Type:** Must be `image/jpeg` or `image/png` (sent as the request header, not JSON).
+
+**Body:** Raw binary image data (not JSON — this is a file upload).
+
+**Constraints:**
+- Maximum file size: 2 MB
+- Accepted formats: JPEG, PNG
+
+**Example (using axios):**
+```typescript
+async function uploadLogo(tenantId: string, file: File) {
+  const buffer = await file.arrayBuffer();
+
+  return api.put(`/v1/tenants/${tenantId}/logo`, buffer, {
+    headers: {
+      'Content-Type': file.type, // 'image/jpeg' or 'image/png'
+    },
+  });
+}
+```
+
+**Response (200):**
+```json
+{
+  "tenant_id": "acme_corp",
+  "logo_key": "logos/acme_corp/logo.png",
+  "content_type": "image/png",
+  "size_bytes": 48291
+}
+```
+
+**Displaying the logo:** Use the GET endpoint below to retrieve a presigned URL, then use it as an `<img src>`.
+
+**Errors:**
+- 400 — unsupported Content-Type, body empty, file exceeds 2 MB
+- 403 — caller is not super_admin
+- 404 — tenant does not exist
+
+---
+
+### GET /v1/tenants/{tenant_id}/logo
+
+Returns a presigned S3 URL for the tenant's logo image. **Any authenticated user.**
+
+Use the returned `presigned_url` directly as `<img src="...">` — no additional auth needed on the image request.
+
+**Response (200):**
+```json
+{
+  "tenant_id": "acme_corp",
+  "presigned_url": "https://s3.eu-west-2.amazonaws.com/sitespy-dev-snapshots-.../logos/acme_corp/logo.png?X-Amz-...",
+  "expires_in": 3600
+}
+```
+
+**Key field: `presigned_url`** — temporary S3 URL valid for 1 hour (3600 seconds). Use directly as an `<img src>`. Re-fetch when expired.
+
+**Key field: `expires_in`** — always 3600. You can cache the URL in memory for up to this duration.
+
+**Example (displaying in React):**
+```typescript
+const { data } = await api.get(`/v1/tenants/${tenantId}/logo`);
+// Use data.presigned_url as <img src={data.presigned_url} alt="Company logo" />
+```
+
+**Errors:**
+- 400 — missing tenant_id path parameter
+- 404 — tenant does not exist, or no logo has been uploaded
 
 ---
 

@@ -1,7 +1,10 @@
 """Sites PATCH handler for SiteSpy — PATCH /v1/sites/{site_id}.
 
-Updates site configuration. Currently supports setting ingest_hours
-(the time window during which image ingestion is active).
+Updates site configuration. Supports:
+- ingest_hours: time window during which image ingestion is active
+- latitude: site latitude (-90 to 90)
+- longitude: site longitude (-180 to 180)
+- timezone: IANA timezone identifier (e.g. 'Europe/London')
 
 Accessible to super admins and tenant admins only.
 """
@@ -20,6 +23,7 @@ from aws_lambda_powertools.metrics import MetricUnit
 from sitespy import data
 from sitespy.errors import ApiError, BadRequest, Forbidden, InternalError, NotFound
 from sitespy.http import error_response, json_response, unhandled_error_response
+from sitespy.validation import validate_latitude, validate_longitude, validate_timezone
 
 # ---------------------------------------------------------------------------
 # Powertools setup
@@ -195,15 +199,48 @@ def _handle(event: dict[str, Any], correlation_id: str) -> dict[str, Any]:
                 "ingest_hours must be an object with 'start' and 'end' fields, or null to clear."
             )
 
+    # --- Process latitude ---
+    if "latitude" in body:
+        lat = body["latitude"]
+        if lat is None:
+            raise BadRequest("latitude cannot be null.")
+        if not isinstance(lat, (int, float)) or isinstance(lat, bool):
+            raise BadRequest("latitude must be a number.")
+        if not validate_latitude(float(lat)):
+            raise BadRequest("latitude must be between -90 and 90.")
+        updates["latitude"] = float(lat)
+
+    # --- Process longitude ---
+    if "longitude" in body:
+        lon = body["longitude"]
+        if lon is None:
+            raise BadRequest("longitude cannot be null.")
+        if not isinstance(lon, (int, float)) or isinstance(lon, bool):
+            raise BadRequest("longitude must be a number.")
+        if not validate_longitude(float(lon)):
+            raise BadRequest("longitude must be between -180 and 180.")
+        updates["longitude"] = float(lon)
+
+    # --- Process timezone ---
+    if "timezone" in body:
+        tz = body["timezone"]
+        if tz is None:
+            raise BadRequest("timezone cannot be null.")
+        if not isinstance(tz, str) or not tz.strip():
+            raise BadRequest("timezone must be a non-empty string.")
+        if not validate_timezone(tz.strip()):
+            raise BadRequest("timezone must be a valid IANA timezone (e.g. 'Europe/London').")
+        updates["timezone"] = tz.strip()
+
     if not updates:
         raise BadRequest("Request body must contain at least one supported field to update.")
 
     # --- Write update to DynamoDB ---
     try:
-        data.update_site_ingest_hours(
+        data.update_site(
             tenant_id=tenant_id,
             site_id=site_id,
-            ingest_hours=updates.get("ingest_hours"),
+            updates=updates,
         )
     except Exception as exc:
         logger.exception("dynamodb_update_site_failed")
@@ -215,8 +252,9 @@ def _handle(event: dict[str, Any], correlation_id: str) -> dict[str, Any]:
         "tenant_id": tenant_id,
     }
 
-    if "ingest_hours" in updates:
-        response_body["ingest_hours"] = updates["ingest_hours"]
+    for key in ("ingest_hours", "latitude", "longitude", "timezone"):
+        if key in updates:
+            response_body[key] = updates[key]
 
     return json_response(200, response_body, correlation_id)
 
