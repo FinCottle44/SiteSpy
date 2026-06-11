@@ -78,6 +78,28 @@ if [[ "$ENV" == "prod" ]]; then
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Load local secrets
+# ─────────────────────────────────────────────────────────────────────────────
+SECRETS_FILE="$PROJECT_ROOT/.env.deploy"
+if [[ ! -f "$SECRETS_FILE" ]]; then
+  echo "ERROR: Missing $SECRETS_FILE"
+  echo ""
+  echo "  Create it with your secrets (it's gitignored):"
+  echo ""
+  echo "    echo 'OPENWEATHER_API_KEY=your_key_here' > .env.deploy"
+  echo ""
+  exit 1
+fi
+
+# shellcheck source=/dev/null
+source "$SECRETS_FILE"
+
+if [[ -z "${OPENWEATHER_API_KEY:-}" ]]; then
+  echo "ERROR: OPENWEATHER_API_KEY not set in $SECRETS_FILE"
+  exit 1
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Build
 # ─────────────────────────────────────────────────────────────────────────────
 echo "→ Building ($ENV)..."
@@ -87,7 +109,7 @@ sam build --config-env "$ENV"
 # Deploy
 # ─────────────────────────────────────────────────────────────────────────────
 echo "→ Deploying ($ENV)..."
-sam deploy --config-env "$ENV"
+sam deploy --config-env "$ENV" --parameter-overrides "OpenWeatherApiKey=$OPENWEATHER_API_KEY"
 
 echo ""
 echo "✓ Deployment to $ENV complete."
