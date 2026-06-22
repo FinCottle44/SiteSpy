@@ -261,7 +261,7 @@ if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
 fi
 
 # ─── Generate temp password ─────────────────────────────────────────────────
-TEMP_PASSWORD="$(openssl rand -base64 16 | tr -dc 'A-Za-z0-9' | head -c 12)$(openssl rand -base64 4 | tr -dc '0-9' | head -c 2)!A"
+TEMP_PASSWORD="$(openssl rand -base64 16 | tr -dc 'A-Za-z0-9' | head -c 12)$(openssl rand -base64 4 | tr -dc '0-9' | head -c 2)"'!A'
 
 # ─── Map role to Cognito group ───────────────────────────────────────────────
 case "$ROLE" in
@@ -284,7 +284,7 @@ fi
 # ─── Create ──────────────────────────────────────────────────────────────────
 echo ""
 echo -n "  Creating Cognito user... "
-SUB=$(aws cognito-idp admin-create-user \
+if ! SUB=$(aws cognito-idp admin-create-user \
   --user-pool-id "$USER_POOL_ID" \
   --username "$EMAIL" \
   --temporary-password "$TEMP_PASSWORD" \
@@ -293,9 +293,7 @@ SUB=$(aws cognito-idp admin-create-user \
   --region "$REGION" \
   --profile "$PROFILE" \
   --query 'User.Username' \
-  --output text 2>&1)
-
-if [ $? -ne 0 ]; then
+  --output text 2>&1); then
   echo -e "${RED}failed${NC}"
   echo "  $SUB"
   exit 1
