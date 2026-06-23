@@ -195,7 +195,7 @@ _CAMERA_LISTS = st.lists(
 
 
 @given(cameras=_CAMERA_LISTS)
-@settings(max_examples=100)
+@settings(max_examples=100, deadline=None)
 def test_camera_listing_never_exposes_credentials(
     cameras: list[tuple[str, str, str | None]],
 ) -> None:

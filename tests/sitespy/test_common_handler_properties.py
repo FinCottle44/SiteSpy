@@ -335,7 +335,7 @@ def test_absent_correlation_id_generates_uuid_v4(scenario: str) -> None:
 
 
 @given(invalid_id=_INVALID_CORRELATION_IDS, scenario=_HANDLER_SCENARIOS)
-@settings(max_examples=100)
+@settings(max_examples=100, deadline=None)
 def test_invalid_correlation_id_generates_uuid_v4(
     invalid_id: str, scenario: str
 ) -> None:

@@ -1,14 +1,12 @@
-"""Cameras rotate-token handler for SiteSpy — POST /v1/sites/{site_id}/cameras/{camera_id}/rotate-credentials.
+"""Cameras PATCH handler for SiteSpy — PATCH /v1/sites/{site_id}/cameras/{camera_id}.
 
-Rotates camera ingest token and returns the new token.
-Tenant admin or super admin.
-
-Requirements validated: 6.1–6.10
+Updates mutable camera metadata (camera_name, camera_model). The camera_id and
+ingest token are immutable. Tenant admin or super admin.
 """
 
 from __future__ import annotations
 
-import os
+import json
 import re
 import time
 import uuid
@@ -17,7 +15,7 @@ from typing import Any
 from aws_lambda_powertools import Logger, Metrics
 from aws_lambda_powertools.metrics import MetricUnit
 
-from sitespy import credentials, data
+from sitespy import data
 from sitespy.errors import ApiError, BadRequest, Forbidden, InternalError, NotFound
 from sitespy.http import error_response, json_response, unhandled_error_response
 from sitespy.sandbox import sandbox_visibility_guard
@@ -34,10 +32,13 @@ metrics = Metrics(namespace="SiteSpy", service="sitespy")
 # ---------------------------------------------------------------------------
 
 _CORRELATION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
-_ROUTE = "POST /v1/sites/{site_id}/cameras/{camera_id}/rotate-credentials"
+_ROUTE = "PATCH /v1/sites/{site_id}/cameras/{camera_id}"
 
 _GROUP_SUPER_ADMINS = "SuperAdmins"
 _GROUP_TENANT_ADMINS = "TenantAdmins"
+
+_CAMERA_NAME_MAX_LEN = 120
+_CAMERA_MODEL_MAX_LEN = 120
 
 
 # ---------------------------------------------------------------------------
@@ -48,7 +49,7 @@ _GROUP_TENANT_ADMINS = "TenantAdmins"
 @logger.inject_lambda_context(log_event=False)
 @metrics.log_metrics(capture_cold_start_metric=True)
 def handler(event: dict[str, Any], _context: Any) -> dict[str, Any]:
-    """Lambda entry point for POST /v1/sites/{site_id}/cameras/{camera_id}/rotate-credentials."""
+    """Lambda entry point for PATCH /v1/sites/{site_id}/cameras/{camera_id}."""
     start_ms = time.monotonic() * 1000
     correlation_id = _resolve_correlation_id(event)
 
@@ -56,9 +57,9 @@ def handler(event: dict[str, Any], _context: Any) -> dict[str, Any]:
         result = _handle(event, correlation_id)
         latency_ms = int(time.monotonic() * 1000 - start_ms)
 
-        metrics.add_metric(name="RotateCredentialsSuccess", unit=MetricUnit.Count, value=1)
+        metrics.add_metric(name="PatchCameraSuccess", unit=MetricUnit.Count, value=1)
         logger.info(
-            "rotate_credentials_success",
+            "patch_camera_success",
             extra={
                 "correlation_id": correlation_id,
                 "route": _ROUTE,
@@ -72,10 +73,10 @@ def handler(event: dict[str, Any], _context: Any) -> dict[str, Any]:
         latency_ms = int(time.monotonic() * 1000 - start_ms)
 
         metrics.add_dimension(name="status_code", value=str(exc.status_code))
-        metrics.add_metric(name="RotateCredentialsFailure", unit=MetricUnit.Count, value=1)
+        metrics.add_metric(name="PatchCameraFailure", unit=MetricUnit.Count, value=1)
 
         logger.warning(
-            "rotate_credentials_failure",
+            "patch_camera_failure",
             extra={
                 "correlation_id": correlation_id,
                 "route": _ROUTE,
@@ -91,10 +92,10 @@ def handler(event: dict[str, Any], _context: Any) -> dict[str, Any]:
         latency_ms = int(time.monotonic() * 1000 - start_ms)
 
         metrics.add_dimension(name="status_code", value="500")
-        metrics.add_metric(name="RotateCredentialsFailure", unit=MetricUnit.Count, value=1)
+        metrics.add_metric(name="PatchCameraFailure", unit=MetricUnit.Count, value=1)
 
         logger.exception(
-            "rotate_credentials_unhandled_error",
+            "patch_camera_unhandled_error",
             extra={
                 "correlation_id": correlation_id,
                 "route": _ROUTE,
@@ -113,7 +114,10 @@ def handler(event: dict[str, Any], _context: Any) -> dict[str, Any]:
 
 
 def _handle(event: dict[str, Any], correlation_id: str) -> dict[str, Any]:
-    """Core logic for POST /v1/sites/{site_id}/cameras/{camera_id}/rotate-credentials."""
+    """Core logic for PATCH /v1/sites/{site_id}/cameras/{camera_id}.
+
+    Tenant admin (own tenant) or super admin only.
+    """
     # --- Extract JWT claims and resolve role ---
     claims = _extract_claims(event)
     role = _resolve_role(claims)
@@ -169,40 +173,92 @@ def _handle(event: dict[str, Any], correlation_id: str) -> dict[str, Any]:
     if camera_item is None:
         raise NotFound("Camera not found.")
 
-    # --- Generate new ingest token ---
-    new_token = credentials.generate_ingest_token()
+    # --- Parse and validate body ---
+    body = _parse_body(event)
+    updates = _build_updates(body)
 
-    # --- Update token in DynamoDB (overwrites GSI1 index entry) ---
+    # --- Apply update ---
     try:
-        data.update_camera_token(
+        data.update_camera(
             tenant_id=tenant_id,
             site_id=site_id,
             camera_id=camera_id,
-            new_token=new_token,
+            updates=updates,
         )
     except Exception as exc:
         logger.exception(
-            "dynamodb_update_camera_token_failed",
+            "dynamodb_update_camera_failed",
             extra={
                 "tenant_id": tenant_id,
                 "site_id": site_id,
                 "camera_id": camera_id,
             },
         )
-        raise InternalError("Failed to rotate camera token.") from exc
+        raise InternalError("Failed to update camera.") from exc
 
-    # --- Build ingest URL ---
-    ingest_base_url = os.environ.get("INGEST_BASE_URL", "")
-    ingest_url = f"{ingest_base_url}/v1/ingest/{new_token}"
+    # --- Build response (merge updates over existing values) ---
+    existing_name = camera_item.get("camera_name", {}).get("S", "")
+    existing_model_attr = camera_item.get("camera_model")
+    existing_model = existing_model_attr.get("S") if existing_model_attr else None
 
-    # --- Return 200 with new token ---
     response_body: dict[str, Any] = {
         "camera_id": camera_id,
-        "ingest_url": ingest_url,
-        "ingest_token": new_token,
+        "site_id": site_id,
+        "tenant_id": tenant_id,
+        "camera_name": updates.get("camera_name", existing_name),
     }
 
+    if "camera_model" in updates:
+        response_body["camera_model"] = updates["camera_model"]
+    elif existing_model is not None:
+        response_body["camera_model"] = existing_model
+
     return json_response(200, response_body, correlation_id)
+
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+
+def _build_updates(body: dict[str, Any]) -> dict[str, Any]:
+    """Validate the body and build the updates map.
+
+    At least one of camera_name / camera_model must be present.
+    - camera_name: required non-empty string when present.
+    - camera_model: non-empty string, or null to clear it.
+    """
+    updates: dict[str, Any] = {}
+
+    if "camera_name" in body:
+        name = body["camera_name"]
+        if not isinstance(name, str) or not name.strip():
+            raise BadRequest("camera_name must be a non-empty string.")
+        if len(name.strip()) > _CAMERA_NAME_MAX_LEN:
+            raise BadRequest(
+                f"camera_name must be at most {_CAMERA_NAME_MAX_LEN} characters."
+            )
+        updates["camera_name"] = name.strip()
+
+    if "camera_model" in body:
+        model = body["camera_model"]
+        if model is None:
+            updates["camera_model"] = None  # clear the attribute
+        elif isinstance(model, str) and model.strip():
+            if len(model.strip()) > _CAMERA_MODEL_MAX_LEN:
+                raise BadRequest(
+                    f"camera_model must be at most {_CAMERA_MODEL_MAX_LEN} characters."
+                )
+            updates["camera_model"] = model.strip()
+        else:
+            raise BadRequest("camera_model must be a non-empty string or null.")
+
+    if not updates:
+        raise BadRequest(
+            "Request body must contain at least one of: camera_name, camera_model."
+        )
+
+    return updates
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +288,31 @@ def _resolve_role(claims: dict[str, Any]) -> str:
     elif _GROUP_TENANT_ADMINS in groups:
         return "tenant_admin"
     return "user"
+
+
+# ---------------------------------------------------------------------------
+# Body parsing
+# ---------------------------------------------------------------------------
+
+
+def _parse_body(event: dict[str, Any]) -> dict[str, Any]:
+    """Parse the JSON request body, raising BadRequest on failure."""
+    raw_body = event.get("body")
+    if raw_body is None:
+        raise BadRequest("Request body is required.")
+
+    if isinstance(raw_body, dict):
+        return raw_body
+
+    try:
+        parsed = json.loads(raw_body)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        raise BadRequest("Request body must be valid JSON.") from None
+
+    if not isinstance(parsed, dict):
+        raise BadRequest("Request body must be a JSON object.")
+
+    return parsed
 
 
 # ---------------------------------------------------------------------------

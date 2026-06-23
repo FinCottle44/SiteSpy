@@ -813,6 +813,57 @@ def update_camera_token(
     )
 
 
+def update_camera(
+    tenant_id: str,
+    site_id: str,
+    camera_id: str,
+    updates: dict[str, Any],
+) -> None:
+    """Update mutable camera attributes (camera_name, camera_model).
+
+    Builds a dynamic UpdateExpression from the provided fields. A value of
+    None for camera_model removes the attribute. The key attributes (PK/SK),
+    ingest_token, and GSI1 mapping are never touched here.
+    """
+    set_parts: list[str] = []
+    remove_parts: list[str] = []
+    attr_values: dict[str, Any] = {}
+    attr_names: dict[str, str] = {}
+
+    for key, value in updates.items():
+        name_placeholder = f"#{key}"
+        attr_names[name_placeholder] = key
+        if value is None:
+            remove_parts.append(name_placeholder)
+        else:
+            value_placeholder = f":{key}"
+            set_parts.append(f"{name_placeholder} = {value_placeholder}")
+            attr_values[value_placeholder] = {"S": str(value)}
+
+    if not set_parts and not remove_parts:
+        return
+
+    clauses: list[str] = []
+    if set_parts:
+        clauses.append(f"SET {', '.join(set_parts)}")
+    if remove_parts:
+        clauses.append(f"REMOVE {', '.join(remove_parts)}")
+
+    kwargs: dict[str, Any] = {
+        "TableName": get_settings().data_table,
+        "Key": {
+            "PK": {"S": build_tenant_pk(tenant_id)},
+            "SK": {"S": build_camera_sk(site_id, camera_id)},
+        },
+        "UpdateExpression": " ".join(clauses),
+        "ExpressionAttributeNames": attr_names,
+    }
+    if attr_values:
+        kwargs["ExpressionAttributeValues"] = attr_values
+
+    _dynamodb_client().update_item(**kwargs)
+
+
 def delete_camera(tenant_id: str, site_id: str, camera_id: str) -> None:
     """Delete a camera record from DynamoDB.
 
@@ -1260,3 +1311,142 @@ def put_live_img_record(
             "ttl": {"N": str(ttl)},
         },
     )
+
+# ---------------------------------------------------------------------------
+# Sandbox provisioning and camera transfer operations (camera-sandbox feature)
+# ---------------------------------------------------------------------------
+
+_SANDBOX_TENANT_ID = "sandbox_construction"
+_SANDBOX_TENANT_NAME = "Sandbox Construction"
+_SANDBOX_STALE_THRESHOLD_HOURS = 24
+_SANDBOX_DEFAULT_SITE_ID = "default_sandbox_site"
+_SANDBOX_DEFAULT_SITE_NAME = "Default Sandbox Site"
+_SANDBOX_DEFAULT_LATITUDE = -33.8688
+_SANDBOX_DEFAULT_LONGITUDE = 151.2093
+_SANDBOX_DEFAULT_TIMEZONE = "Australia/Sydney"
+
+
+def ensure_sandbox_tenant_record() -> bool:
+    """Create the sandbox tenant record if it doesn't exist.
+
+    Uses conditional PutItem: attribute_not_exists(PK).
+    Returns True if created, False if already existed.
+
+    Requirements (camera-sandbox): 1.2, 1.3
+    """
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    item: dict[str, Any] = {
+        "PK": {"S": build_tenant_pk(_SANDBOX_TENANT_ID)},
+        "SK": {"S": build_tenant_sk(_SANDBOX_TENANT_ID)},
+        "tenant_name": {"S": _SANDBOX_TENANT_NAME},
+        "stale_threshold_hours": {"N": str(_SANDBOX_STALE_THRESHOLD_HOURS)},
+        "created_at": {"S": now},
+    }
+    try:
+        _dynamodb_client().put_item(
+            TableName=get_settings().data_table,
+            Item=item,
+            ConditionExpression="attribute_not_exists(PK)",
+        )
+        return True
+    except _dynamodb_client().exceptions.ConditionalCheckFailedException:
+        return False
+
+
+def ensure_sandbox_default_site() -> bool:
+    """Create the default sandbox site record if it doesn't exist.
+
+    Uses conditional PutItem: attribute_not_exists(PK) AND attribute_not_exists(SK).
+    Returns True if created, False if already existed.
+
+    Requirements (camera-sandbox): 1.4
+    """
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    item: dict[str, Any] = {
+        "PK": {"S": build_tenant_pk(_SANDBOX_TENANT_ID)},
+        "SK": {"S": build_site_sk(_SANDBOX_DEFAULT_SITE_ID)},
+        "site_name": {"S": _SANDBOX_DEFAULT_SITE_NAME},
+        "latitude": {"N": str(_SANDBOX_DEFAULT_LATITUDE)},
+        "longitude": {"N": str(_SANDBOX_DEFAULT_LONGITUDE)},
+        "timezone": {"S": _SANDBOX_DEFAULT_TIMEZONE},
+        "created_at": {"S": now},
+    }
+    try:
+        _dynamodb_client().put_item(
+            TableName=get_settings().data_table,
+            Item=item,
+            ConditionExpression="attribute_not_exists(PK) AND attribute_not_exists(SK)",
+        )
+        return True
+    except _dynamodb_client().exceptions.ConditionalCheckFailedException:
+        return False
+
+
+def transfer_camera(
+    source_tenant_id: str,
+    source_site_id: str,
+    target_tenant_id: str,
+    target_site_id: str,
+    camera_id: str,
+    camera_name: str,
+    camera_model: str | None,
+    ingest_token: str,
+    created_at: str,
+) -> None:
+    """Atomically move a camera from source to target using transact_write_items.
+
+    Transaction items (in order):
+    1. Put — create camera at target with ConditionExpression
+       attribute_not_exists(PK) AND attribute_not_exists(SK)
+    2. Delete — remove camera at source with ConditionExpression
+       attribute_exists(PK)
+
+    The Put item includes a ``transferred_at`` timestamp recording when the
+    transfer occurred. The original ``created_at`` is preserved.
+
+    If either condition fails, the entire transaction is rejected and no
+    changes are applied.
+
+    Raises:
+        botocore.exceptions.ClientError: On transaction failure (e.g., conflict
+        at target or source already deleted by concurrent request).
+
+    Requirements (camera-sandbox): 5.3, 5.4, 5.5, 5.6, 7.1
+    """
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    table_name = get_settings().data_table
+
+    target_item: dict[str, Any] = {
+        "PK": {"S": build_tenant_pk(target_tenant_id)},
+        "SK": {"S": build_camera_sk(target_site_id, camera_id)},
+        "GSI1PK": {"S": f"TOKEN#{ingest_token}"},
+        "GSI1SK": {"S": "CAMERA"},
+        "camera_name": {"S": camera_name},
+        "ingest_token": {"S": ingest_token},
+        "created_at": {"S": created_at},
+        "transferred_at": {"S": now},
+    }
+    if camera_model is not None:
+        target_item["camera_model"] = {"S": camera_model}
+
+    transact_items = [
+        {
+            "Put": {
+                "TableName": table_name,
+                "Item": target_item,
+                "ConditionExpression": "attribute_not_exists(PK) AND attribute_not_exists(SK)",
+            }
+        },
+        {
+            "Delete": {
+                "TableName": table_name,
+                "Key": {
+                    "PK": {"S": build_tenant_pk(source_tenant_id)},
+                    "SK": {"S": build_camera_sk(source_site_id, camera_id)},
+                },
+                "ConditionExpression": "attribute_exists(PK)",
+            }
+        },
+    ]
+
+    _dynamodb_client().transact_write_items(TransactItems=transact_items)

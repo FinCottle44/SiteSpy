@@ -16,6 +16,7 @@ from aws_lambda_powertools.metrics import MetricUnit
 from sitespy import data
 from sitespy.errors import ApiError, BadRequest, Forbidden, InternalError, NotFound
 from sitespy.http import error_response, json_response, unhandled_error_response
+from sitespy.sandbox import sandbox_visibility_guard
 
 # ---------------------------------------------------------------------------
 # Powertools setup
@@ -122,6 +123,9 @@ def _handle(event: dict[str, Any], correlation_id: str) -> dict[str, Any]:
 
     if not tenant_id:
         raise BadRequest("Missing required query parameter: tenant_id.")
+
+    # --- Sandbox visibility guard ---
+    sandbox_visibility_guard(tenant_id, role)
 
     # --- Extract path parameters ---
     path_params = event.get("pathParameters") or {}

@@ -16,6 +16,7 @@ from aws_lambda_powertools.metrics import MetricUnit
 from sitespy import data
 from sitespy.errors import ApiError, Forbidden, InternalError
 from sitespy.http import error_response, json_response, unhandled_error_response
+from sitespy.sandbox import is_sandbox_tenant
 
 # ---------------------------------------------------------------------------
 # Powertools setup
@@ -125,6 +126,10 @@ def _handle(event: dict[str, Any], correlation_id: str) -> dict[str, Any]:
             "tenant_name": item.get("tenant_name", {}).get("S", ""),
             "retention_years": int(item.get("retention_years", {}).get("N", "5")),
         })
+
+    # --- Filter out sandbox tenant for non-super_admin roles (future-proofing) ---
+    if role in ("tenant_admin", "user"):
+        tenants = [t for t in tenants if not is_sandbox_tenant(t["tenant_id"])]
 
     return json_response(200, {"tenants": tenants}, correlation_id)
 

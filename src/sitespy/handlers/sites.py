@@ -22,6 +22,7 @@ from aws_lambda_powertools.metrics import MetricUnit
 from sitespy import data
 from sitespy.errors import ApiError, BadRequest, Forbidden, InternalError, NotFound
 from sitespy.http import error_response, json_response, unhandled_error_response
+from sitespy.sandbox import sandbox_visibility_guard
 
 # ---------------------------------------------------------------------------
 # Powertools setup
@@ -167,6 +168,7 @@ def _handle(event: dict[str, Any], correlation_id: str) -> dict[str, Any]:
                     "Super admins must supply tenant_id as a query parameter."
                 )
 
+        sandbox_visibility_guard(tenant_id_param, role)
         site_item = _fetch_site_or_404(tenant_id_param, site_id)
         site_tenant_id = tenant_id_param
 
@@ -175,6 +177,7 @@ def _handle(event: dict[str, Any], correlation_id: str) -> dict[str, Any]:
         if not caller_tenant_id:
             raise Forbidden()
 
+        sandbox_visibility_guard(caller_tenant_id, role)
         site_item = _fetch_site_or_404(caller_tenant_id, site_id)
         site_tenant_id = caller_tenant_id
 
@@ -443,6 +446,9 @@ def _handle_list(event: dict[str, Any], correlation_id: str) -> dict[str, Any]:
         if not caller_tenant_id:
             raise Forbidden()
         tenant_id = caller_tenant_id
+
+    # --- Sandbox visibility guard ---
+    sandbox_visibility_guard(tenant_id, role)
 
     # --- Fetch all sites for the tenant ---
     try:

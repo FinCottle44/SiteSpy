@@ -20,6 +20,7 @@ from aws_lambda_powertools.metrics import MetricUnit
 from sitespy import data, storage
 from sitespy.errors import ApiError, BadRequest, Forbidden, InternalError, NotFound
 from sitespy.http import error_response, json_response, unhandled_error_response
+from sitespy.sandbox import sandbox_visibility_guard
 
 # ---------------------------------------------------------------------------
 # Powertools setup
@@ -134,6 +135,9 @@ def _handle(event: dict[str, Any], correlation_id: str) -> dict[str, Any]:
         if not caller_tenant_id:
             raise Forbidden()
         tenant_id = caller_tenant_id
+
+    # --- Sandbox visibility guard ---
+    sandbox_visibility_guard(tenant_id, role)
 
     # --- Parse JSON body ---
     body = _parse_body(event)

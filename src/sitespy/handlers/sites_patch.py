@@ -23,6 +23,7 @@ from aws_lambda_powertools.metrics import MetricUnit
 from sitespy import data
 from sitespy.errors import ApiError, BadRequest, Forbidden, InternalError, NotFound
 from sitespy.http import error_response, json_response, unhandled_error_response
+from sitespy.sandbox import sandbox_visibility_guard
 from sitespy.validation import validate_latitude, validate_longitude, validate_timezone
 
 # ---------------------------------------------------------------------------
@@ -139,6 +140,9 @@ def _handle(event: dict[str, Any], correlation_id: str) -> dict[str, Any]:
         if not caller_tenant_id:
             raise Forbidden()
         tenant_id = caller_tenant_id
+
+    # --- Sandbox visibility guard ---
+    sandbox_visibility_guard(tenant_id, role)
 
     # --- Extract site_id from path ---
     path_params = event.get("pathParameters") or {}

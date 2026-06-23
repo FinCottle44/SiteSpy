@@ -255,6 +255,8 @@ Returns `201 Created`. The super admin must still create the first `TenantAdmin`
 
 Lists all tenants. Super admin only. Used to populate the tenant picker.
 
+**Sandbox visibility:** The hidden `sandbox_construction` tenant is filtered from responses for non-super_admin roles. Since this endpoint is currently super_admin-only, this is a future-proofing measure.
+
 ### PATCH /v1/tenants/{tenant_id}
 
 Updates a tenant's display name, contact email, or staleness threshold. Cannot change `tenant_id`. Super admin only.
@@ -371,6 +373,54 @@ Updates `camera_name` or `camera_model`. `camera_id` is immutable. Tenant admin 
 Generates a new credential pair for the camera, stores it in Secrets Manager (replacing the previous version), and returns the new pair **once**. Tenant admin or above.
 
 The old credential is immediately invalidated. Any in-flight ingest from the camera will fail with `401` until the Axis device is reconfigured with the new pair.
+
+### POST /v1/cameras/transfer
+
+Atomically moves a camera from one tenant/site to another, preserving the ingest token so the physical camera continues working without reconfiguration. **Super admin only.**
+
+This is the mechanism for transferring cameras from the hidden sandbox tenant (`sandbox_construction`) to a customer tenant after provisioning and testing, but it works between any two tenants.
+
+**Body:**
+```json
+{
+  "source_tenant_id": "sandbox_construction",
+  "source_site_id": "default_sandbox_site",
+  "camera_id": "cam_01",
+  "target_tenant_id": "acme_corp",
+  "target_site_id": "site_001"
+}
+```
+
+All five fields are required non-empty strings.
+
+**Response body (200):**
+```json
+{
+  "tenant_id": "acme_corp",
+  "site_id": "site_001",
+  "camera_id": "cam_01"
+}
+```
+
+**Atomicity:** The transfer uses a DynamoDB `transact_write_items` — the target record is created and the source record is deleted in a single transaction. At no point does the GSI1 token index resolve to zero or two records, so ingestion continues uninterrupted during transfer.
+
+**What transfers:** `camera_id`, `camera_name`, `camera_model`, `ingest_token` (and its GSI1 mapping). A `transferred_at` timestamp is added to the target record.
+
+**What does NOT transfer:** Snapshot records (`IMG#`) remain under the source tenant. They are test data and are not moved.
+
+**Error responses:**
+
+| Condition | Code | Error Key | Message |
+|-----------|------|-----------|---------|
+| Caller is not super_admin | 403 | `ACCESS_DENIED` | "You do not have access to this resource." |
+| Missing/empty required field | 400 | `BAD_REQUEST` | "Missing required field: {field_name}." |
+| Source camera not found | 404 | `NOT_FOUND` | "Source camera not found." |
+| Target tenant not found | 404 | `NOT_FOUND` | "Target tenant not found." |
+| Target site not found or doesn't belong to target tenant | 404 | `NOT_FOUND` | "Target site not found." |
+| Camera already exists at target site | 409 | `CONFLICT` | "A camera with this camera_id already exists at the target site." |
+| Transaction failure | 500 | `INTERNAL_ERROR` | "An internal error occurred." |
+
+---
 
 ### DELETE /v1/sites/{site_id}/cameras/{camera_id}
 

@@ -480,6 +480,25 @@ Resources:
             Path: /v1/sites/{site_id}/cameras
             Method: POST
 
+  # ── Cameras Transfer Lambda ──────────────────────────────────────────────────
+  CamerasTransferFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub sitespy-${Environment}-cameras-transfer
+      CodeUri: src/
+      Handler: sitespy.handlers.cameras_transfer.handler
+      Description: Transfers a camera from one tenant/site to another (super admin only).
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DataTable
+      Events:
+        PostCamerasTransfer:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SiteSpyApi
+            Path: /v1/cameras/transfer
+            Method: POST
+
   # ── Users POST Lambda ──────────────────────────────────────────────────────
   UsersPostFunction:
     Type: AWS::Serverless::Function
@@ -546,6 +565,25 @@ Resources:
             RestApiId: !Ref SiteSpyApi
             Path: /v1/sites/{site_id}/cameras/{camera_id}
             Method: DELETE
+
+  # ── Cameras PATCH Lambda ───────────────────────────────────────────────────
+  CamerasPatchFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub sitespy-${Environment}-cameras-patch
+      CodeUri: src/
+      Handler: sitespy.handlers.cameras_patch.handler
+      Description: Updates camera metadata (tenant admin or super admin).
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DataTable
+      Events:
+        PatchCamera:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SiteSpyApi
+            Path: /v1/sites/{site_id}/cameras/{camera_id}
+            Method: PATCH
 
   # ── Users GET Lambda ─────────────────────────────────────────────────────────
   UsersGetFunction:

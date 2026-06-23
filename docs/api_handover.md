@@ -626,7 +626,6 @@ Registers a new camera on a site and mints an ingest token. **Super admin only.*
 ### GET /v1/sites/{site_id}/cameras
 
 Lists all cameras on a site. **Tenant admin or super admin.**
-
 **Query params:**
 - `tenant_id` (required for super admins; tenant admins use their own tenant from JWT)
 
@@ -652,10 +651,51 @@ Returns an empty array if no cameras exist. Credentials are never included in th
 
 ---
 
+### PATCH /v1/sites/{site_id}/cameras/{camera_id}
+
+Updates a camera's editable metadata. Use this to rename a camera or change its model. **Tenant admin or super admin.** (Tenant admins can only edit cameras within their own tenant.)
+
+`camera_id` and the ingest token are immutable and cannot be changed here.
+
+**Query params:**
+- `tenant_id` (required for super admins; tenant admins use their own tenant from JWT)
+
+**Body — at least one field required:**
+```json
+{
+  "camera_name": "South gate",
+  "camera_model": "Axis Q6135-LE"
+}
+```
+
+**Field rules:**
+- `camera_name` — optional; when present must be a non-empty string (max 120 chars)
+- `camera_model` — optional; a non-empty string (max 120 chars), or `null` to clear it
+- At least one of `camera_name` / `camera_model` must be present
+
+**Response (200):**
+```json
+{
+  "camera_id": "cam_01",
+  "site_id": "site_001",
+  "tenant_id": "acme_corp",
+  "camera_name": "South gate",
+  "camera_model": "Axis Q6135-LE"
+}
+```
+
+The response reflects the camera's state after the update. `camera_model` is omitted if the camera has no model set.
+
+**Errors:**
+- 400 — empty body, invalid/empty `camera_name`, invalid `camera_model`, or super admin missing tenant_id query param
+- 403 — caller is a regular user, or tenant admin editing another tenant's camera
+- 404 — camera does not exist
+
+---
+
 ### POST /v1/sites/{site_id}/cameras/{camera_id}/rotate-credentials
 
 Rotates the ingest token for a camera. **Tenant admin or super admin.**
-
 **Query params:**
 - `tenant_id` (required for super admins; tenant admins use their own tenant from JWT)
 
@@ -945,3 +985,61 @@ These endpoints are planned for future phases:
 - `POST /v1/exports` — bulk image export
 
 The dashboard should be designed with these features in mind but they can be stubbed initially.
+
+---
+
+## Camera Transfer (Super Admin)
+
+### POST /v1/cameras/transfer
+
+Moves a camera from one tenant/site to another. Designed for the camera staging workflow: cameras are provisioned and tested in the hidden `sandbox_construction` tenant, then transferred to the customer's tenant once verified. **Super admin only.**
+
+**Body:**
+```json
+{
+  "source_tenant_id": "sandbox_construction",
+  "source_site_id": "default_sandbox_site",
+  "camera_id": "cam_01",
+  "target_tenant_id": "acme_corp",
+  "target_site_id": "site_001"
+}
+```
+
+All five fields are required non-empty strings.
+
+**Response (200):**
+```json
+{
+  "tenant_id": "acme_corp",
+  "site_id": "site_001",
+  "camera_id": "cam_01"
+}
+```
+
+**What happens on transfer:**
+- The camera record moves to the target tenant/site
+- The ingest token is preserved — the physical camera keeps working without reconfiguration
+- Historical snapshots stay in the source tenant (they're test data)
+- The camera immediately appears in the target site's camera list
+
+**Errors:**
+| Code | Error Key | Meaning | Frontend Action |
+|------|-----------|---------|----------------|
+| 400 | `BAD_REQUEST` | Missing/empty required field | Show which field is invalid (from `message`) |
+| 403 | `ACCESS_DENIED` | Not super_admin | Show access denied |
+| 404 | `NOT_FOUND` | Source camera, target tenant, or target site not found | Show error toast with the `message` |
+| 409 | `CONFLICT` | Camera already exists at target | Show "camera already exists at this site" |
+| 500 | `INTERNAL_ERROR` | Transaction failure | Show generic error with retry |
+
+**Suggested UX:** A "Transfer Camera" dialog in the super admin view for the sandbox tenant. The dialog shows a target tenant picker, then a site picker within that tenant. On success, the camera disappears from the sandbox view and appears in the customer's site.
+
+---
+
+## Sandbox Tenant (Super Admin Only)
+
+The system has a hidden tenant `sandbox_construction` ("Sandbox Construction") used for camera staging. Key points for the frontend:
+
+1. **Not visible to customers.** The sandbox tenant never appears in `GET /v1/tenants` for non-super_admin roles. No frontend filtering needed — the API handles it.
+2. **403 for non-super_admins.** If any non-super_admin user somehow navigates to a URL referencing `sandbox_construction`, all API calls will return `403 ACCESS_DENIED`. Handle this like any other access denied response.
+3. **Super admins see it normally.** For super admins, the sandbox tenant appears in the tenant list and works like any other tenant — you can view sites, cameras, and snapshots within it.
+4. **Transfer button.** The primary action on sandbox cameras is "Transfer to customer." This calls `POST /v1/cameras/transfer` (above).
