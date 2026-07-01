@@ -145,6 +145,7 @@ def test_put_live_session_writes_correct_item():
         ttl=1750006200,
         created_by="user-sub-123",
         created_at="2025-06-15T14:00:00Z",
+        now_ts="2025-06-15T14:00:00Z",
     )
 
     # Read back from DynamoDB directly
@@ -181,9 +182,11 @@ def test_put_live_session_raises_conditional_check_on_duplicate():
         ttl=1750006200,
         created_by="user-sub-001",
         created_at="2025-06-15T14:00:00Z",
+        now_ts="2025-06-15T14:00:00Z",
     )
 
-    # Second write for the same camera should fail
+    # Second write for the same camera should fail — the first session is still
+    # active (now is before its expires_at of 14:10:00Z).
     with pytest.raises(ClientError) as exc_info:
         put_live_session(
             tenant_id="acme",
@@ -194,9 +197,59 @@ def test_put_live_session_raises_conditional_check_on_duplicate():
             ttl=1750006800,
             created_by="user-sub-002",
             created_at="2025-06-15T14:10:00Z",
+            now_ts="2025-06-15T14:05:00Z",
         )
 
     assert exc_info.value.response["Error"]["Code"] == "ConditionalCheckFailedException"
+
+
+@mock_aws
+def test_put_live_session_overwrites_expired_session():
+    """put_live_session overwrites a stale, expired SESSION# record.
+
+    DynamoDB TTL deletion is lazy, so an expired session can physically remain
+    in the table. A new POST must be able to replace it rather than being
+    blocked with a false 'session already active' conflict.
+    """
+    client = boto3.client("dynamodb", region_name="eu-west-2")
+    _create_table(client)
+
+    # First session — already expired relative to the second write's "now".
+    put_live_session(
+        tenant_id="acme",
+        site_id="site_01",
+        camera_id="cam_01",
+        session_id="expired-session-id",
+        expires_at="2025-06-15T14:10:00Z",
+        ttl=1750006200,
+        created_by="user-sub-001",
+        created_at="2025-06-15T14:00:00Z",
+        now_ts="2025-06-15T14:00:00Z",
+    )
+
+    # Second write — now is past the first session's expiry, so it should succeed.
+    put_live_session(
+        tenant_id="acme",
+        site_id="site_01",
+        camera_id="cam_01",
+        session_id="fresh-session-id",
+        expires_at="2025-06-15T14:30:00Z",
+        ttl=1750007400,
+        created_by="user-sub-002",
+        created_at="2025-06-15T14:20:00Z",
+        now_ts="2025-06-15T14:20:00Z",
+    )
+
+    response = client.get_item(
+        TableName="test-data-table",
+        Key={
+            "PK": {"S": "TENANT#acme"},
+            "SK": {"S": "SESSION#site_01#cam_01"},
+        },
+    )
+    item = response["Item"]
+    assert item["session_id"]["S"] == "fresh-session-id"
+    assert item["expires_at"]["S"] == "2025-06-15T14:30:00Z"
 
 
 # ---------------------------------------------------------------------------

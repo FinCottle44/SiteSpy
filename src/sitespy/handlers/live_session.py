@@ -314,6 +314,7 @@ def _handle_post(event: dict[str, Any], correlation_id: str) -> dict[str, Any]:
             ttl=ttl,
             created_by=created_by,
             created_at=now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            now_ts=now.strftime("%Y-%m-%dT%H:%M:%SZ"),
         )
     except Exception as exc:
         # ConditionalCheckFailedException means a race condition — another

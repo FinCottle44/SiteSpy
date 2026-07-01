@@ -107,6 +107,19 @@ sam build --config-env "$ENV"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Deploy
+#
+# NOTE: passing --parameter-overrides on the CLI *replaces* (does not merge with)
+# the parameter_overrides in samconfig.toml. We only pass OpenWeatherApiKey here
+# because it's a secret sourced from .env.deploy and must not be committed.
+#
+# Every other template parameter (Environment, DomainName, CertificateArn, the
+# Cognito IDs, etc.) is intentionally omitted: for an existing stack, CloudFormation
+# reuses the previously-deployed value (UsePreviousValue). The non-secret reference
+# values still live in samconfig.toml's parameter_overrides.
+#
+# Caveat: this relies on the stack already existing with correct values. A brand-new
+# stack would fall back to template defaults for the omitted params — for a first-time
+# deploy, pass the full parameter set explicitly instead.
 # ─────────────────────────────────────────────────────────────────────────────
 echo "→ Deploying ($ENV)..."
 sam deploy --config-env "$ENV" --parameter-overrides "OpenWeatherApiKey=$OPENWEATHER_API_KEY"

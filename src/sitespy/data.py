@@ -1186,12 +1186,23 @@ def put_live_session(
     ttl: int,
     created_by: str,
     created_at: str,
+    now_ts: str,
 ) -> None:
     """Write a SESSION# record to DynamoDB with duplicate prevention.
 
-    Uses ConditionExpression attribute_not_exists(SK) so that a second
-    concurrent POST for the same camera raises ConditionalCheckFailedException
-    rather than silently overwriting an active session.
+    The ConditionExpression allows the write only when no SESSION# record
+    exists OR the existing one has already expired. A genuinely active session
+    (``expires_at`` in the future) causes a ConditionalCheckFailedException so
+    that a second concurrent POST cannot clobber it.
+
+    Allowing overwrite of an *expired* record is required because DynamoDB TTL
+    deletion is lazy (an expired item can physically linger for up to ~48h).
+    Without this, a stale-but-unreaped session would block all new sessions
+    for the camera until DynamoDB happened to reap it.
+
+    ``now_ts`` and ``expires_at`` are ISO 8601 UTC strings in the fixed
+    ``%Y-%m-%dT%H:%M:%SZ`` format, so lexicographic comparison is equivalent
+    to chronological comparison.
 
     Requirements (live-view): 2.1, 2.4, 2.5, 2.11, 2.13, 6.2, 6.5
     """
@@ -1206,7 +1217,8 @@ def put_live_session(
             "created_by": {"S": created_by},
             "created_at": {"S": created_at},
         },
-        ConditionExpression="attribute_not_exists(SK)",
+        ConditionExpression="attribute_not_exists(SK) OR expires_at <= :now",
+        ExpressionAttributeValues={":now": {"S": now_ts}},
     )
 
 
