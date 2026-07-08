@@ -1,0 +1,4 @@
+# Placeholder — the static ffmpeg binary must be placed in this directory as `ffmpeg`.
+# See ../README.md for download/install instructions.
+# This file exists only so the empty bin/ directory is tracked by git.
+# Do NOT commit this file to production once the real binary is added (optional).

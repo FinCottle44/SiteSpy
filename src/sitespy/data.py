@@ -16,6 +16,7 @@ import boto3
 import botocore.config
 
 from sitespy.config import get_settings
+from sitespy.timelapse import build_job_sk
 
 logger = logging.getLogger(__name__)
 
@@ -1462,3 +1463,223 @@ def transfer_camera(
     ]
 
     _dynamodb_client().transact_write_items(TransactItems=transact_items)
+
+
+# ---------------------------------------------------------------------------
+# Timelapse job operations (JOB# records) — timelapse-generation feature
+# ---------------------------------------------------------------------------
+
+
+def put_timelapse_job(
+    tenant_id: str,
+    job_id: str,
+    site_id: str,
+    camera_id: str,
+    start_ts: str,
+    end_ts: str,
+    length_seconds: int,
+    fps: int,
+    status: str,
+    created_at: str,
+    ttl: int,
+    requested_by: str | None = None,
+) -> None:
+    """Write a JOB# record to DynamoDB (unconditional PutItem).
+
+    Record schema:
+
+    +----------------+-------+--------------------------------------------+
+    | Attribute      | Type  | Value                                      |
+    +================+=======+============================================+
+    | PK             | S     | TENANT#<tenant_id>                         |
+    | SK             | S     | JOB#<job_id>                               |
+    | job_id         | S     | Convenience copy for responses             |
+    | site_id        | S     | For authorization on retrieve              |
+    | camera_id      | S     | Camera identifier                          |
+    | start_ts       | S     | ISO 8601, normalized                       |
+    | end_ts         | S     | ISO 8601, normalized                       |
+    | length_seconds | N     | Requested output duration in seconds       |
+    | fps            | N     | Requested output frames per second         |
+    | status         | S     | queued | processing | complete | failed    |
+    | created_at     | S     | ISO 8601 UTC timestamp                      |
+    | requested_by   | S     | Caller identity; omitted when None          |
+    | ttl            | N     | Epoch seconds; created_at + job_ttl_days    |
+    +----------------+-------+--------------------------------------------+
+
+    ``requested_by`` is written only when not ``None``; a ``None`` value
+    simply omits the attribute (read back as null).
+
+    No ConditionExpression — ``job_id`` is a fresh uuid4, so writes never
+    collide.
+
+    Requirements: 1.4, 5.1, 6.1, 6.7
+    """
+    item: dict[str, Any] = {
+        "PK": {"S": build_tenant_pk(tenant_id)},
+        "SK": {"S": build_job_sk(job_id)},
+        "job_id": {"S": job_id},
+        "site_id": {"S": site_id},
+        "camera_id": {"S": camera_id},
+        "start_ts": {"S": start_ts},
+        "end_ts": {"S": end_ts},
+        "length_seconds": {"N": str(length_seconds)},
+        "fps": {"N": str(fps)},
+        "status": {"S": status},
+        "created_at": {"S": created_at},
+        "ttl": {"N": str(ttl)},
+    }
+    if requested_by is not None:
+        item["requested_by"] = {"S": requested_by}
+    _dynamodb_client().put_item(
+        TableName=get_settings().data_table,
+        Item=item,
+    )
+
+
+def get_timelapse_job(tenant_id: str, job_id: str) -> Mapping[str, Any] | None:
+    """Fetch a JOB# record from DynamoDB.
+
+    Single GetItem keyed by (TENANT#<tenant_id>, JOB#<job_id>).
+    Returns None if the item does not exist.
+
+    Requirements: 5.1
+    """
+    response: dict[str, Any] = _dynamodb_client().get_item(
+        TableName=get_settings().data_table,
+        Key={
+            "PK": {"S": build_tenant_pk(tenant_id)},
+            "SK": {"S": build_job_sk(job_id)},
+        },
+    )
+    return response.get("Item")
+
+
+def update_timelapse_job_status(
+    tenant_id: str,
+    job_id: str,
+    status: str,
+    artifact_key: str | None = None,
+    failure_reason: str | None = None,
+    set_completed_at: bool = False,
+) -> None:
+    """Update the status of a JOB# record.
+
+    Always sets ``status`` and ``updated_at``. Optionally sets ``artifact_key``
+    (when the render completes) and/or ``failure_reason`` (when the render
+    fails). ``status`` is a reserved word in DynamoDB, so it is referenced via
+    an ExpressionAttributeName placeholder.
+
+    When ``set_completed_at`` is True, ``completed_at`` is set using
+    ``if_not_exists(completed_at, :now)`` so an already-stored value is never
+    overwritten on subsequent updates (Requirement 6.2). The timestamp is in
+    ISO 8601 UTC format.
+
+    Requirements: 4.4, 4.6, 6.2
+    """
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    set_parts = ["#status = :status", "updated_at = :updated_at"]
+    expr_attr_names = {"#status": "status"}
+    expr_attr_values: dict[str, Any] = {
+        ":status": {"S": status},
+        ":updated_at": {"S": now},
+    }
+
+    if artifact_key is not None:
+        set_parts.append("artifact_key = :artifact_key")
+        expr_attr_values[":artifact_key"] = {"S": artifact_key}
+
+    if failure_reason is not None:
+        set_parts.append("failure_reason = :failure_reason")
+        expr_attr_values[":failure_reason"] = {"S": failure_reason}
+
+    if set_completed_at:
+        set_parts.append("completed_at = if_not_exists(completed_at, :now)")
+        expr_attr_values[":now"] = {"S": now}
+
+    _dynamodb_client().update_item(
+        TableName=get_settings().data_table,
+        Key={
+            "PK": {"S": build_tenant_pk(tenant_id)},
+            "SK": {"S": build_job_sk(job_id)},
+        },
+        UpdateExpression=f"SET {', '.join(set_parts)}",
+        ExpressionAttributeNames=expr_attr_names,
+        ExpressionAttributeValues=expr_attr_values,
+    )
+
+
+def list_timelapse_jobs(
+    tenant_id: str,
+    exclusive_start_key: dict | None = None,
+    limit: int = 20,
+) -> tuple[list[Mapping[str, Any]], dict | None]:
+    """Query JOB# records for a tenant, one page per call.
+
+    Queries the base table with ``PK = TENANT#<tenant_id>`` and
+    ``begins_with(SK, "JOB#")``, passing ``Limit`` and an optional
+    ``ExclusiveStartKey`` — mirroring the :func:`list_img_records`
+    pagination pattern. No ``IndexName`` is used (the base table is queried
+    directly). The ``JOB#`` prefix guarantees only Timelapse_Job records are
+    returned; site/camera/user/flag records use other SK prefixes.
+
+    Ordering and filtering (``site_id`` / ``camera_id`` / ``status`` and the
+    ``created_at`` sort) are the handler's responsibility.
+
+    Returns ``(items, last_evaluated_key)``. ``last_evaluated_key`` is None
+    when there are no more pages.
+
+    Requirements: 2.1, 3.4, 3.6
+    """
+    kwargs: dict[str, Any] = {
+        "TableName": get_settings().data_table,
+        "KeyConditionExpression": "PK = :pk AND begins_with(SK, :sk_prefix)",
+        "ExpressionAttributeValues": {
+            ":pk": {"S": build_tenant_pk(tenant_id)},
+            ":sk_prefix": {"S": "JOB#"},
+        },
+        "Limit": limit,
+    }
+    if exclusive_start_key:
+        kwargs["ExclusiveStartKey"] = exclusive_start_key
+
+    response = _dynamodb_client().query(**kwargs)
+    return response.get("Items", []), response.get("LastEvaluatedKey")
+
+
+def list_all_img_records_in_range(
+    tenant_id: str,
+    site_id: str,
+    camera_id: str,
+    from_ts: str,
+    to_ts: str,
+) -> list[Mapping[str, Any]]:
+    """Enumerate all IMG# records for a camera within [from_ts, to_ts].
+
+    Pages through :func:`list_img_records` until exhausted and returns the
+    complete set of items in chronological (ascending) order. ``list_img_records``
+    queries with ``ScanIndexForward=False`` (newest first), so the accumulated
+    items are reversed to yield ascending order suitable for frame selection.
+
+    Requirements: 3.1
+    """
+    items: list[Mapping[str, Any]] = []
+    exclusive_start_key: dict | None = None
+
+    while True:
+        page, last_key = list_img_records(
+            tenant_id,
+            site_id,
+            camera_id,
+            from_ts,
+            to_ts,
+            exclusive_start_key=exclusive_start_key,
+        )
+        items.extend(page)
+        if not last_key:
+            break
+        exclusive_start_key = last_key
+
+    # list_img_records returns descending (newest first); reverse for ascending.
+    items.reverse()
+    return items

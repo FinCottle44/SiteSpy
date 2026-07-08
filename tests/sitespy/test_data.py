@@ -369,3 +369,119 @@ def test_get_users_for_tenant_returns_empty_list_when_no_users():
 
     items = get_users_for_tenant("empty_tenant")
     assert items == []
+
+
+# ---------------------------------------------------------------------------
+# list_timelapse_jobs tests
+# Requirements validated: 2.1
+# ---------------------------------------------------------------------------
+from unittest.mock import patch
+
+from sitespy.data import list_timelapse_jobs
+
+
+def _seed_mixed_partition(client):
+    """Seed one tenant partition with a JOB# record plus site/camera/user/flag
+    records that share the same PK but use other SK prefixes."""
+    # A Timelapse_Job record — the only item the query should return.
+    client.put_item(
+        TableName="test-data-table",
+        Item={
+            "PK": {"S": "TENANT#acme"},
+            "SK": {"S": "JOB#job-001"},
+            "job_id": {"S": "job-001"},
+            "site_id": {"S": "site_01"},
+            "camera_id": {"S": "cam_01"},
+            "start_ts": {"S": "2025-06-01T00:00:00Z"},
+            "end_ts": {"S": "2025-06-07T23:59:59Z"},
+            "length_seconds": {"N": "60"},
+            "fps": {"N": "24"},
+            "status": {"S": "complete"},
+            "created_at": {"S": "2025-06-08T09:15:00Z"},
+            "ttl": {"N": "1751000000"},
+        },
+    )
+    # A site record (SK begins with SITE#, not #CAM#).
+    client.put_item(
+        TableName="test-data-table",
+        Item={
+            "PK": {"S": "TENANT#acme"},
+            "SK": {"S": "SITE#site_01"},
+            "site_name": {"S": "Main Site"},
+        },
+    )
+    # A camera record.
+    client.put_item(
+        TableName="test-data-table",
+        Item={
+            "PK": {"S": "TENANT#acme"},
+            "SK": {"S": "SITE#site_01#CAM#cam_01"},
+            "camera_name": {"S": "Front Camera"},
+        },
+    )
+    # A user record.
+    client.put_item(
+        TableName="test-data-table",
+        Item={
+            "PK": {"S": "TENANT#acme"},
+            "SK": {"S": "USER#sub-123"},
+            "sub": {"S": "sub-123"},
+            "email": {"S": "user@acme.example.com"},
+        },
+    )
+    # A flag record.
+    client.put_item(
+        TableName="test-data-table",
+        Item={
+            "PK": {"S": "TENANT#acme"},
+            "SK": {"S": "FLAG#site_01#cam_01#2025-06-01T00:00:00Z"},
+            "flag_id": {"S": "flag-001"},
+            "status": {"S": "open"},
+        },
+    )
+
+
+@mock_aws
+def test_list_timelapse_jobs_returns_only_job_records():
+    """list_timelapse_jobs returns ONLY JOB# items from a mixed partition;
+    site/camera/user/flag records under the same PK are excluded (Req 2.1)."""
+    os.environ.setdefault("DATA_TABLE", "test-data-table")
+    os.environ.setdefault("AWS_REGION", "eu-west-2")
+
+    client = boto3.client("dynamodb", region_name="eu-west-2")
+    _create_table(client)
+    _seed_mixed_partition(client)
+
+    items, last_evaluated_key = list_timelapse_jobs("acme", limit=50)
+
+    # Exactly one item — the JOB# record — is returned.
+    assert len(items) == 1
+    assert items[0]["SK"]["S"] == "JOB#job-001"
+    assert items[0]["job_id"]["S"] == "job-001"
+
+    # No other SK prefixes leak through.
+    returned_sks = [item["SK"]["S"] for item in items]
+    assert all(sk.startswith("JOB#") for sk in returned_sks)
+
+    # Partition exhausted in a single page.
+    assert last_evaluated_key is None
+
+
+@mock_aws
+def test_list_timelapse_jobs_uses_no_index_name():
+    """list_timelapse_jobs queries the base table, never a GSI: the query call
+    is issued without an IndexName argument (Req 2.1)."""
+    os.environ.setdefault("DATA_TABLE", "test-data-table")
+    os.environ.setdefault("AWS_REGION", "eu-west-2")
+
+    client = boto3.client("dynamodb", region_name="eu-west-2")
+    _create_table(client)
+    _seed_mixed_partition(client)
+
+    real_client = _dynamodb_client()
+    with patch.object(real_client, "query", wraps=real_client.query) as spy_query:
+        list_timelapse_jobs("acme", limit=50)
+
+    assert spy_query.call_count >= 1
+    for call in spy_query.call_args_list:
+        assert "IndexName" not in call.kwargs

@@ -276,3 +276,79 @@ class TestPutLiveSnapshot:
 
         response = client.head_object(Bucket="test-snapshots-bucket", Key=key)
         assert response["ContentType"] == "image/jpeg"
+
+
+# ===========================================================================
+# timelapse_artifact_exists unit tests
+# Requirements validated: 5.3, 8.3
+# ===========================================================================
+from botocore.exceptions import ClientError
+
+from sitespy.storage import (
+    build_timelapse_key,
+    put_timelapse_artifact,
+    timelapse_artifact_exists,
+)
+
+
+class TestTimelapseArtifactExists:
+    """Tests for timelapse_artifact_exists — HeadObject existence check.
+
+    - Existing object -> True
+    - Missing object (404 / NoSuchKey) -> False
+    - Unexpected (non-404) S3 error propagates (Requirement 8.3)
+    """
+
+    @mock_aws
+    def test_returns_true_when_artifact_exists(self):
+        """An existing Artifact object returns True."""
+        os.environ.setdefault("SNAPSHOTS_BUCKET", "test-snapshots-bucket")
+        os.environ.setdefault("AWS_REGION", "eu-west-2")
+
+        client = boto3.client("s3", region_name="eu-west-2")
+        _create_bucket(client)
+
+        key = build_timelapse_key("acme", "site_01", "cam_01", "job-123")
+        put_timelapse_artifact(key, b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 100)
+
+        assert timelapse_artifact_exists(key) is True
+
+    @mock_aws
+    def test_returns_false_when_artifact_missing(self):
+        """A missing Artifact object (404 / NoSuchKey) returns False."""
+        os.environ.setdefault("SNAPSHOTS_BUCKET", "test-snapshots-bucket")
+        os.environ.setdefault("AWS_REGION", "eu-west-2")
+
+        client = boto3.client("s3", region_name="eu-west-2")
+        _create_bucket(client)
+
+        key = build_timelapse_key("acme", "site_01", "cam_01", "does-not-exist")
+
+        assert timelapse_artifact_exists(key) is False
+
+    def test_unexpected_s3_error_propagates(self, monkeypatch):
+        """A non-404 S3 error (e.g. 500 InternalError) propagates to the caller."""
+        os.environ.setdefault("SNAPSHOTS_BUCKET", "test-snapshots-bucket")
+        os.environ.setdefault("AWS_REGION", "eu-west-2")
+
+        class _RaisingClient:
+            def head_object(self, **_kwargs):
+                raise ClientError(
+                    {
+                        "Error": {
+                            "Code": "InternalError",
+                            "Message": "We encountered an internal error.",
+                        }
+                    },
+                    "HeadObject",
+                )
+
+        from sitespy import storage as storage_module
+
+        monkeypatch.setattr(storage_module, "_s3_client", lambda: _RaisingClient())
+
+        key = build_timelapse_key("acme", "site_01", "cam_01", "job-err")
+
+        with pytest.raises(ClientError) as exc_info:
+            timelapse_artifact_exists(key)
+        assert exc_info.value.response["Error"]["Code"] == "InternalError"

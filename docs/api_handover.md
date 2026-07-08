@@ -346,6 +346,186 @@ Invalid transitions return `409 CONFLICT`.
 
 ---
 
+## Timelapse Jobs
+
+A timelapse job renders a camera's snapshots over a date range into an MP4. The
+flow is: **submit** a job (`POST`), **poll** its status (`GET .../{job_id}`) or
+**list** jobs (`GET`), and once a job is `complete` use the presigned
+`download_url` to fetch the video.
+
+Job lifecycle `status` is one of: `queued`, `processing`, `complete`, `failed`.
+
+Job records and their rendered artifacts are retained for **30 days**, then
+expire together — a listed `complete` job whose artifact has since expired
+reports `artifact_available: false` instead of a broken link (see below).
+
+---
+
+### POST /v1/timelapse-jobs
+
+Submits a render job. It is created `queued` and processed asynchronously. Any
+user with access to the site can submit.
+
+**Query params:**
+- `tenant_id` (required for super admins only)
+
+**Body:**
+```json
+{
+  "site_id": "site_001",
+  "camera_id": "cam_01",
+  "start": "2025-06-01T00:00:00Z",
+  "end": "2025-06-07T23:59:59Z",
+  "length_seconds": 60,
+  "fps": 24
+}
+```
+
+**Field rules:**
+- `site_id` — required
+- `camera_id` — required
+- `start` — required, ISO8601 date or datetime. Date-only (`2025-06-01`) expands to start-of-day (`T00:00:00Z`).
+- `end` — required, ISO8601 date or datetime. Date-only expands to end-of-day (`T23:59:59Z`). Must be strictly after `start`.
+- `length_seconds` — optional, integer 1–120, default 60 (target output duration)
+- `fps` — optional, integer 1–30, default 24
+
+**Response (202):**
+```json
+{
+  "job_id": "b3f1c2a4-...",
+  "status": "queued"
+}
+```
+
+Poll `GET /v1/timelapse-jobs/{job_id}` with the returned `job_id` to track progress.
+
+**Errors:**
+- 400 — missing/blank required field, invalid date/datetime format, `end` not after `start`, `length_seconds`/`fps` out of range, or super admin missing `tenant_id`
+- 403 — caller lacks access to the site
+- 404 — site does not exist, or no footage exists in the requested range
+- 500 — persistence or enqueue failure
+
+---
+
+### GET /v1/timelapse-jobs/{job_id}
+
+Returns a single job's current status and, when complete, a freshly presigned
+download URL.
+
+**Query params:**
+- `tenant_id` (required for super admins only)
+
+**Response — queued / processing (200):**
+```json
+{
+  "status": "processing",
+  "requested_by": "jane.doe@acme.example.com",
+  "completed_at": null
+}
+```
+
+**Response — complete, artifact available (200):**
+```json
+{
+  "status": "complete",
+  "requested_by": "jane.doe@acme.example.com",
+  "completed_at": "2025-06-08T09:17:22Z",
+  "download_url": "https://s3.eu-west-2.amazonaws.com/...",
+  "expires_in": 3600
+}
+```
+
+**Response — complete, artifact expired/gone (200):**
+```json
+{
+  "status": "complete",
+  "requested_by": "jane.doe@acme.example.com",
+  "completed_at": "2025-06-08T09:17:22Z",
+  "artifact_available": false
+}
+```
+
+**Response — failed (200):**
+```json
+{
+  "status": "failed",
+  "requested_by": "jane.doe@acme.example.com",
+  "completed_at": null,
+  "reason": "No frames could be decoded in the requested range."
+}
+```
+
+**Field notes:**
+- `requested_by` — the submitter (JWT `sub`, falling back to email), or `null` if neither was present.
+- `completed_at` — ISO8601 UTC timestamp, non-null only when `status` is `complete`.
+- `download_url` / `expires_in` — present only for a `complete` job whose artifact still exists. `expires_in` is always 3600 (1 hour). Mint-on-read: do not cache beyond expiry.
+- `artifact_available: false` — present only for a `complete` job whose artifact has expired. Show a "no longer available" state, not a broken link.
+- `reason` — present only when `status` is `failed`.
+
+**Errors:**
+- 400 — missing `job_id`, or super admin missing `tenant_id`
+- 404 — job does not exist, **or** the caller is not authorized for it (existence is deliberately not leaked, so treat 404 as "not available to you")
+- 500 — lookup failure
+
+---
+
+### GET /v1/timelapse-jobs
+
+Returns a paginated, filterable list of the tenant's jobs, newest-first. Use it
+for an "all renders" view (tenant-wide) or a "renders for this camera" view
+(with `site_id` + `camera_id`).
+
+**Query params:**
+- `site_id` (optional filter)
+- `camera_id` (optional filter — **requires** `site_id`)
+- `status` (optional filter — one of `queued`, `processing`, `complete`, `failed`)
+- `limit` (optional, 1–100, default 20)
+- `cursor` (optional, opaque token from a previous response)
+- `tenant_id` (required for super admins only)
+
+Filters are exact, case-sensitive, and AND-combined.
+
+**Response (200):**
+```json
+{
+  "jobs": [
+    {
+      "job_id": "b3f1c2a4-...",
+      "site_id": "site_001",
+      "camera_id": "cam_01",
+      "start": "2025-06-01T00:00:00Z",
+      "end": "2025-06-07T23:59:59Z",
+      "length_seconds": 60,
+      "status": "complete",
+      "created_at": "2025-06-08T09:15:00Z",
+      "completed_at": "2025-06-08T09:17:22Z",
+      "requested_by": "jane.doe@acme.example.com",
+      "download_url": "https://s3.eu-west-2.amazonaws.com/...",
+      "expires_in": 3600
+    }
+  ],
+  "next_cursor": "eyJQSyI6IC4uLn0="
+}
+```
+
+**Ordering:** newest-first by `created_at` descending, with `job_id` descending as a stable tie-break.
+
+**Per-entry fields:** same download/availability rules as the single-job endpoint — `download_url` + `expires_in` (3600) appear only for a `complete` job with an existing artifact; `artifact_available: false` appears only for a `complete` job whose artifact has expired; `completed_at` is `null` unless `complete`; `requested_by` is `null` when it was never captured.
+
+**Pagination:** pass `next_cursor` back as `?cursor=<value>`. `null` means the last page. Treat cursors as opaque.
+
+**Scope by role:**
+- **Super admin:** all jobs in the specified `tenant_id`
+- **Tenant admin:** all jobs in their tenant
+- **User:** only jobs whose `site_id` is in their `custom:site_access`. A supplied `site_id` outside their access, or an empty access list, returns `200` with an empty `jobs` array and `next_cursor: null` (not an error).
+
+**Errors:**
+- 400 — blank `site_id`/`camera_id`/`status`, `camera_id` without `site_id`, invalid `status`, `limit` outside 1–100 / non-integer, invalid `cursor`, or super admin missing `tenant_id`
+- 403 — tenant admin / user with no resolvable tenant
+- 500 — DynamoDB or S3 failure (no partial `jobs` returned)
+
+---
+
 ## Error Responses
 
 All errors follow this shape:
@@ -981,10 +1161,11 @@ const { data } = await api.get(`/v1/tenants/${tenantId}/logo`);
 
 These endpoints are planned for future phases:
 
-- `POST /v1/timelapses` — timelapse generation
 - `POST /v1/exports` — bulk image export
 
 The dashboard should be designed with these features in mind but they can be stubbed initially.
+
+> Timelapse generation has shipped — see the **Timelapse Jobs** section above (`POST /v1/timelapse-jobs`, `GET /v1/timelapse-jobs/{job_id}`, `GET /v1/timelapse-jobs`).
 
 ---
 

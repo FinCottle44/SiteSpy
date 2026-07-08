@@ -116,6 +116,10 @@ Resources:
             Prefix: live/
             Status: Enabled
             ExpirationInDays: 1
+          - Id: ExpireTimelapseArtifacts
+            Prefix: timelapse/
+            Status: Enabled
+            ExpirationInDays: 30
       CorsConfiguration:
         CorsRules:
           - AllowedOrigins: ["*"]
@@ -169,6 +173,52 @@ Resources:
           Value: SiteSpy
         - Key: Environment
           Value: !Ref Environment
+
+  # ── SQS: timelapse job queue + dead-letter queue ──────────────────────────
+  # Decouples timelapse submission from rendering. The Worker consumes from
+  # TimelapseJobQueue; messages that fail maxReceiveCount times are routed to
+  # TimelapseJobDLQ. VisibilityTimeout is >= 6x the Worker's 300s timeout.
+  TimelapseJobDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub sitespy-${Environment}-timelapse-jobs-dlq
+      MessageRetentionPeriod: 1209600
+      Tags:
+        - Key: Project
+          Value: SiteSpy
+        - Key: Environment
+          Value: !Ref Environment
+
+  TimelapseJobQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub sitespy-${Environment}-timelapse-jobs
+      VisibilityTimeout: 1800
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt TimelapseJobDLQ.Arn
+        maxReceiveCount: 3
+      Tags:
+        - Key: Project
+          Value: SiteSpy
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── Lambda Layer: static ffmpeg binary ────────────────────────────────────
+  # Provides the ffmpeg binary at /opt/bin/ffmpeg for the timelapse Worker to
+  # encode selected snapshots into an H.264 MP4. arm64 build to match the
+  # stack-wide Architectures: [arm64] Global.
+  FfmpegLayer:
+    Type: AWS::Serverless::LayerVersion
+    DeletionPolicy: Delete
+    Properties:
+      LayerName: !Sub sitespy-${Environment}-ffmpeg
+      Description: Static ffmpeg (arm64) binary for timelapse rendering.
+      ContentUri: layers/ffmpeg/
+      CompatibleArchitectures:
+        - arm64
+      CompatibleRuntimes:
+        - python3.12
+      RetentionPolicy: Delete
 
   # ── API Gateway: REST API with /v1/ prefix ────────────────────────────────
   SiteSpyApi:
@@ -736,6 +786,120 @@ Resources:
             Auth:
               Authorizer: NONE
             # No API Gateway authorizer — token auth is validated inside the Lambda.
+
+  # ── Timelapse POST Lambda ──────────────────────────────────────────────────
+  TimelapsePostFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub sitespy-${Environment}-timelapse-post
+      CodeUri: src/
+      Handler: sitespy.handlers.timelapse_post.handler
+      Description: Submits a timelapse render job and enqueues it for processing.
+      Environment:
+        Variables:
+          JOB_QUEUE_URL: !Ref TimelapseJobQueue
+          MAX_LENGTH_SECONDS: 120
+          MAX_FPS: 30
+          RETENTION_DAYS: 30
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DataTable
+        - Statement:
+            - Effect: Allow
+              Action: sqs:SendMessage
+              Resource: !GetAtt TimelapseJobQueue.Arn
+      Events:
+        PostTimelapseJob:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SiteSpyApi
+            Path: /v1/timelapse-jobs
+            Method: POST
+
+  # ── Timelapse GET Lambda ─────────────────────────────────────────────────────
+  TimelapseGetFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub sitespy-${Environment}-timelapse-get
+      CodeUri: src/
+      Handler: sitespy.handlers.timelapse_get.handler
+      Description: Returns timelapse job status and a presigned download URL when complete.
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref DataTable
+        - Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub "arn:aws:s3:::${SnapshotsBucket}/timelapse/*"
+      Events:
+        GetTimelapseJob:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SiteSpyApi
+            Path: /v1/timelapse-jobs/{job_id}
+            Method: GET
+
+  # ── Timelapse LIST Lambda ────────────────────────────────────────────────────
+  TimelapseListFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub sitespy-${Environment}-timelapse-list
+      CodeUri: src/
+      Handler: sitespy.handlers.timelapse_list.handler
+      Description: Returns a paginated, filterable list of timelapse jobs with presigned download URLs for completed jobs.
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref DataTable
+        - Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub "arn:aws:s3:::${SnapshotsBucket}/timelapse/*"
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub "arn:aws:s3:::${SnapshotsBucket}"
+      Events:
+        ListTimelapseJobs:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SiteSpyApi
+            Path: /v1/timelapse-jobs
+            Method: GET
+
+  # ── Timelapse Worker Lambda (SQS-triggered) ──────────────────────────────────
+  TimelapseWorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub sitespy-${Environment}-timelapse-worker
+      CodeUri: src/
+      Handler: sitespy.handlers.timelapse_worker.handler
+      Description: Renders queued timelapse jobs into MP4 artifacts with ffmpeg.
+      Timeout: 300
+      MemorySize: 3008
+      EphemeralStorage:
+        Size: 10240
+      Layers:
+        - !Ref FfmpegLayer
+      Environment:
+        Variables:
+          FFMPEG_PATH: /opt/bin/ffmpeg
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DataTable
+        - Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub "arn:aws:s3:::${SnapshotsBucket}/*"
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub "arn:aws:s3:::${SnapshotsBucket}/timelapse/*"
+      Events:
+        JobQueue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt TimelapseJobQueue.Arn
+            BatchSize: 1
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
 
   # ── Custom Domain (prod only) ─────────────────────────────────────────────
   ApiDomainName:
