@@ -126,7 +126,7 @@ class TestActiveSessionTimelapsSaved:
         with (
             patch("sitespy.data.get_camera_by_token", return_value=_CAMERA_ITEM),
             patch("sitespy.data.get_site_ingest_hours", return_value=None),
-            patch("sitespy.data.get_latest_img_record", return_value=_old_img_record()),
+            patch("sitespy.data.get_latest_any_img_record", return_value=_old_img_record()),
             patch("sitespy.data.get_live_session", return_value=_active_session_record()),
             patch("sitespy.data.get_retention_years", return_value=5),
             patch("sitespy.storage.put_snapshot"),
@@ -161,7 +161,7 @@ class TestActiveSessionCadenceSuppressed:
         with (
             patch("sitespy.data.get_camera_by_token", return_value=_CAMERA_ITEM),
             patch("sitespy.data.get_site_ingest_hours", return_value=None),
-            patch("sitespy.data.get_latest_img_record", return_value=_recent_img_record()),
+            patch("sitespy.data.get_latest_any_img_record", return_value=_recent_img_record()),
             patch("sitespy.data.get_live_session", return_value=_active_session_record()),
             patch("sitespy.storage.put_live_snapshot") as mock_put_live,
             patch("sitespy.data.put_live_img_record") as mock_put_live_record,
@@ -191,7 +191,7 @@ class TestNoSessionTimelapsSaved:
         with (
             patch("sitespy.data.get_camera_by_token", return_value=_CAMERA_ITEM),
             patch("sitespy.data.get_site_ingest_hours", return_value=None),
-            patch("sitespy.data.get_latest_img_record", return_value=_old_img_record()),
+            patch("sitespy.data.get_latest_any_img_record", return_value=_old_img_record()),
             patch("sitespy.data.get_live_session", return_value=None),
             patch("sitespy.data.get_retention_years", return_value=5),
             patch("sitespy.storage.put_snapshot"),
@@ -226,7 +226,7 @@ class TestNoSessionCadenceSuppressed:
         with (
             patch("sitespy.data.get_camera_by_token", return_value=_CAMERA_ITEM),
             patch("sitespy.data.get_site_ingest_hours", return_value=None),
-            patch("sitespy.data.get_latest_img_record", return_value=_recent_img_record()),
+            patch("sitespy.data.get_latest_any_img_record", return_value=_recent_img_record()),
             patch("sitespy.data.get_live_session", return_value=None),
         ):
             result = _handle(event, "test-correlation-id")
@@ -252,7 +252,7 @@ class TestLiveS3WriteFailure:
         with (
             patch("sitespy.data.get_camera_by_token", return_value=_CAMERA_ITEM),
             patch("sitespy.data.get_site_ingest_hours", return_value=None),
-            patch("sitespy.data.get_latest_img_record", return_value=_recent_img_record()),
+            patch("sitespy.data.get_latest_any_img_record", return_value=_recent_img_record()),
             patch("sitespy.data.get_live_session", return_value=_active_session_record()),
             patch(
                 "sitespy.storage.put_live_snapshot",

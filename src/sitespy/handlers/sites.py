@@ -204,21 +204,10 @@ def _handle(event: dict[str, Any], correlation_id: str) -> dict[str, Any]:
         "cameras": cameras,
     }
 
-    # Include ingest_hours if configured
-    ingest_hours_attr = site_item.get("ingest_hours")
-    if ingest_hours_attr is not None:
-        m = ingest_hours_attr.get("M")
-        if m:
-            start = m.get("start", {}).get("S")
-            end = m.get("end", {}).get("S")
-            if start and end:
-                body["ingest_hours"] = {"start": start, "end": end}
-            else:
-                body["ingest_hours"] = None
-        else:
-            body["ingest_hours"] = None
-    else:
-        body["ingest_hours"] = None
+    # Emit working_hours ({days, start, end}) with backward-compatible
+    # resolution of legacy ingest_hours (derived to all seven days); null when
+    # unset (Req 1.1, 2.1, 2.2).
+    body["working_hours"] = data.resolve_working_hours_attr(site_item)
 
     return json_response(200, body, correlation_id)
 
@@ -476,21 +465,10 @@ def _handle_list(event: dict[str, Any], correlation_id: str) -> dict[str, Any]:
             "timezone": item.get("timezone", {}).get("S", "Europe/London"),
         }
 
-        # Include ingest_hours if configured
-        ingest_hours_attr = item.get("ingest_hours")
-        if ingest_hours_attr is not None:
-            m = ingest_hours_attr.get("M")
-            if m:
-                start = m.get("start", {}).get("S")
-                end = m.get("end", {}).get("S")
-                if start and end:
-                    site_entry["ingest_hours"] = {"start": start, "end": end}
-                else:
-                    site_entry["ingest_hours"] = None
-            else:
-                site_entry["ingest_hours"] = None
-        else:
-            site_entry["ingest_hours"] = None
+        # Emit working_hours ({days, start, end}) with backward-compatible
+        # resolution of legacy ingest_hours (derived to all seven days); null
+        # when unset (Req 1.1, 2.1, 2.2).
+        site_entry["working_hours"] = data.resolve_working_hours_attr(item)
 
         sites.append(site_entry)
 

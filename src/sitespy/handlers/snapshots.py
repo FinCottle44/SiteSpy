@@ -5,7 +5,10 @@ GET /v1/snapshots/latest returns the most recent snapshot for a single camera
 ``camera_id`` is omitted).
 
 GET /v1/snapshots returns a paginated list of snapshots for a camera within a
-date range.
+date range. Passing ``sample=N`` switches to preview mode, returning up to N
+snapshots spread evenly in time across the requested window instead of one
+contiguous page — intended for scrubber UIs that represent a whole period
+without rendering a timelapse.
 
 Requirements validated: 3.1, 3.4, 3.5, 4.4, 4.5, 4.7, 6.1, 6.2, 6.3, 6.4
 """
@@ -18,6 +21,7 @@ import re
 import time
 import uuid
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -48,6 +52,14 @@ _PRESIGNED_TTL = 300  # 5 minutes
 _LIST_DEFAULT_LIMIT = 50
 _LIST_MAX_LIMIT = 200
 _LIST_DEFAULT_DAYS_BACK = 30
+
+# Sampled preview mode (``?sample=N``): return up to N snapshots spread evenly
+# across the requested [from, to] window, for scrubber/preview UIs that need to
+# represent a whole period without paging through every snapshot.
+_SAMPLE_MAX = 500
+# Fan-out width for the per-bucket DynamoDB queries. Each bucket query is a
+# Limit=1 key-range read, so the work is latency-bound rather than CPU-bound.
+_SAMPLE_FANOUT = 16
 
 # Cognito group names
 _GROUP_SUPER_ADMINS = "SuperAdmins"
@@ -169,6 +181,23 @@ def _handle_list(event: dict[str, Any], correlation_id: str) -> dict[str, Any]:
     else:
         limit = _LIST_DEFAULT_LIMIT
 
+    # --- Parse and validate sample (evenly-spaced preview mode) ---
+    raw_sample = query_params.get("sample")
+    sample: int | None = None
+    if raw_sample is not None and str(raw_sample).strip() != "":
+        try:
+            sample = int(raw_sample)
+        except (ValueError, TypeError):
+            raise BadRequest("sample must be an integer.") from None
+        if sample < 1 or sample > _SAMPLE_MAX:
+            raise BadRequest(f"sample must be between 1 and {_SAMPLE_MAX}.")
+
+    # --- Parse and validate order (asc | desc, default desc) ---
+    raw_order = (query_params.get("order") or "").strip().lower() or "desc"
+    if raw_order not in ("asc", "desc"):
+        raise BadRequest("order must be 'asc' or 'desc'.")
+    ascending = raw_order == "asc"
+
     # --- Parse from/to with defaults and normalization ---
     now_utc = datetime.now(tz=UTC)
     default_from = now_utc - timedelta(days=_LIST_DEFAULT_DAYS_BACK)
@@ -182,6 +211,11 @@ def _handle_list(event: dict[str, Any], correlation_id: str) -> dict[str, Any]:
     # --- Decode cursor ---
     exclusive_start_key: dict | None = None
     raw_cursor = (query_params.get("cursor") or "").strip() or None
+    if raw_cursor and sample is not None:
+        raise BadRequest(
+            "sample and cursor cannot be combined: sampled preview mode always "
+            "covers the whole [from, to] window and is not paginated."
+        )
     if raw_cursor:
         try:
             decoded = base64.b64decode(raw_cursor.encode()).decode()
@@ -214,19 +248,39 @@ def _handle_list(event: dict[str, Any], correlation_id: str) -> dict[str, Any]:
     _check_access(role, caller_tenant_id, tenant_id, site_id, site_access)
 
     # --- Query DynamoDB ---
-    try:
-        items, last_evaluated_key = data.list_img_records(
-            tenant_id=tenant_id,
-            site_id=site_id,
-            camera_id=camera_id,
-            from_ts=from_ts,
-            to_ts=to_ts,
-            limit=limit,
-            exclusive_start_key=exclusive_start_key,
-        )
-    except Exception as exc:
-        logger.exception("dynamodb_list_img_records_failed")
-        raise InternalError() from exc
+    if sample is not None:
+        # Sampled preview mode: one representative snapshot per equal-width time
+        # bucket across the window. `limit` and `cursor` do not apply.
+        try:
+            items = _query_sampled(
+                tenant_id=tenant_id,
+                site_id=site_id,
+                camera_id=camera_id,
+                from_ts=from_ts,
+                to_ts=to_ts,
+                sample=sample,
+            )
+        except Exception as exc:
+            logger.exception("dynamodb_sampled_query_failed")
+            raise InternalError() from exc
+        last_evaluated_key = None
+        if not ascending:
+            items = list(reversed(items))
+    else:
+        try:
+            items, last_evaluated_key = data.list_img_records(
+                tenant_id=tenant_id,
+                site_id=site_id,
+                camera_id=camera_id,
+                from_ts=from_ts,
+                to_ts=to_ts,
+                limit=limit,
+                exclusive_start_key=exclusive_start_key,
+                ascending=ascending,
+            )
+        except Exception as exc:
+            logger.exception("dynamodb_list_img_records_failed")
+            raise InternalError() from exc
 
     # --- Build image list with pre-signed URLs ---
     images = []
@@ -262,14 +316,128 @@ def _handle_list(event: dict[str, Any], correlation_id: str) -> dict[str, Any]:
 
     # --- total_available: best-effort count ---
     # MVP: return count of items on this page + 1 if there's a next page.
+    # In sampled mode the response covers the whole window, so the count is exact.
     total_available = len(images) + (1 if next_cursor is not None else 0)
 
-    body = {
+    body: dict[str, Any] = {
         "images": images,
         "next_cursor": next_cursor,
         "total_available": total_available,
     }
+
+    if sample is not None:
+        # Echo the resolved window so a scrubber can map timeline position to
+        # time directly, and flag that these frames are a sample, not a page.
+        body["sampled"] = True
+        body["sample_requested"] = sample
+        body["window"] = {"from": from_ts, "to": to_ts}
+
     return json_response(200, body, correlation_id)
+
+
+# ---------------------------------------------------------------------------
+# Sampled preview helpers
+# ---------------------------------------------------------------------------
+
+
+def _query_sampled(
+    *,
+    tenant_id: str,
+    site_id: str,
+    camera_id: str,
+    from_ts: str,
+    to_ts: str,
+    sample: int,
+) -> list[Mapping[str, Any]]:
+    """Return up to ``sample`` snapshots spread evenly across [from_ts, to_ts].
+
+    The window is divided into ``sample`` equal-width time buckets and the
+    earliest snapshot in each bucket is selected. This spaces the result evenly
+    in **time** rather than by index, so a scrubber's position maps linearly to
+    the window even when capture density varies (for example when a camera was
+    offline for part of the period).
+
+    Cost is bounded by the requested ``sample`` — each bucket is a single
+    ``Limit=1`` key-range query — so it does not grow with how many snapshots
+    exist in the window. Buckets containing no snapshots contribute nothing,
+    which means genuine gaps in coverage stay visible to the caller.
+
+    Returns items in chronological (ascending) order, de-duplicated by sort key.
+    """
+    buckets = _build_time_buckets(from_ts, to_ts, sample)
+
+    def fetch(bucket: tuple[str, str]) -> Mapping[str, Any] | None:
+        bucket_from, bucket_to = bucket
+        items, _ = data.list_img_records(
+            tenant_id=tenant_id,
+            site_id=site_id,
+            camera_id=camera_id,
+            from_ts=bucket_from,
+            to_ts=bucket_to,
+            limit=1,
+            ascending=True,
+        )
+        return items[0] if items else None
+
+    max_workers = min(_SAMPLE_FANOUT, len(buckets))
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        results = list(pool.map(fetch, buckets))
+
+    # Buckets are already chronological; drop misses and de-duplicate by SK
+    # (windows shorter than the bucket count can collapse onto the same record).
+    selected: list[Mapping[str, Any]] = []
+    seen: set[str] = set()
+    for item in results:
+        if item is None:
+            continue
+        sk = item.get("SK", {}).get("S", "")
+        if sk in seen:
+            continue
+        seen.add(sk)
+        selected.append(item)
+
+    return selected
+
+
+def _build_time_buckets(from_ts: str, to_ts: str, count: int) -> list[tuple[str, str]]:
+    """Split [from_ts, to_ts] into ``count`` contiguous, non-overlapping buckets.
+
+    Both inputs are normalized ``YYYY-MM-DDTHH:MM:SSZ`` strings. Because
+    DynamoDB range keys are compared lexicographically and that format sorts
+    chronologically, bucket bounds can be used directly in a ``BETWEEN`` query.
+
+    ``BETWEEN`` is inclusive at both ends, so every bucket except the last ends
+    one second before the next begins. The final bucket ends exactly at
+    ``to_ts`` so the window's last snapshot is always reachable.
+    """
+    start = _parse_normalized(from_ts)
+    end = _parse_normalized(to_ts)
+
+    total_seconds = (end - start).total_seconds()
+    if count <= 1 or total_seconds <= 0:
+        return [(from_ts, to_ts)]
+
+    buckets: list[tuple[str, str]] = []
+    for index in range(count):
+        bucket_start = start + timedelta(seconds=total_seconds * index / count)
+        if index == count - 1:
+            bucket_end = end
+        else:
+            next_start = start + timedelta(seconds=total_seconds * (index + 1) / count)
+            bucket_end = max(next_start - timedelta(seconds=1), bucket_start)
+        buckets.append((_format_normalized(bucket_start), _format_normalized(bucket_end)))
+
+    return buckets
+
+
+def _parse_normalized(ts: str) -> datetime:
+    """Parse a normalized ``YYYY-MM-DDTHH:MM:SSZ`` timestamp into a UTC datetime."""
+    return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+
+
+def _format_normalized(value: datetime) -> str:
+    """Render a UTC datetime as ``YYYY-MM-DDTHH:MM:SSZ``."""
+    return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 # ---------------------------------------------------------------------------
@@ -309,7 +477,9 @@ def _normalize_timestamp(
         dt = datetime.fromisoformat(normalized)
         return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     except ValueError:
-        raise BadRequest(f"Invalid datetime format: {raw!r}. Use ISO8601 (e.g. 2025-06-15 or 2025-06-15T14:00:00Z).")
+        raise BadRequest(
+            f"Invalid datetime format: {raw!r}. Use ISO8601 (e.g. 2025-06-15 or 2025-06-15T14:00:00Z)."
+        )
 
 
 # ---------------------------------------------------------------------------

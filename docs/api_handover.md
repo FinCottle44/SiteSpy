@@ -76,11 +76,18 @@ Returns all sites accessible to the caller.
       "tenant_id": "acme",
       "latitude": 51.5074,
       "longitude": -0.1278,
-      "timezone": "Europe/London"
+      "timezone": "Europe/London",
+      "working_hours": {
+        "days": ["mon", "tue", "wed", "thu", "fri"],
+        "start": "07:00",
+        "end": "18:00"
+      }
     }
   ]
 }
 ```
+
+**Key field: `working_hours`** — the site's working-hours window (days of week + HH:MM time range), or `null` when unset. Snapshots captured inside this window get long-term retention; those captured outside get a fixed 7-day expiry. See `PATCH /v1/sites/{site_id}` for the full model. `null` means every snapshot is treated as in-hours.
 
 **Scope by role:**
 - **Super admin:** all sites in the specified tenant
@@ -105,6 +112,11 @@ Returns site metadata and its camera list. This is the first call after login �
   "latitude": 51.5074,
   "longitude": -0.1278,
   "timezone": "Europe/London",
+  "working_hours": {
+    "days": ["mon", "tue", "wed", "thu", "fri"],
+    "start": "07:00",
+    "end": "18:00"
+  },
   "cameras": [
     {
       "camera_id": "cam_01",
@@ -122,11 +134,15 @@ Returns site metadata and its camera list. This is the first call after login �
 
 **Important:** The `timezone` field (IANA format, e.g. `Europe/London`) is the authoritative timezone for displaying all timestamps related to this site. Never use the browser's local timezone.
 
+**Key field: `working_hours`** — `{days, start, end}` or `null`. Working hours are evaluated in the site's `timezone` to classify each captured snapshot's retention (see `PATCH /v1/sites/{site_id}`). `null` means every snapshot is treated as in-hours. The legacy `ingest_hours` field is no longer returned.
+
 ---
 
 ### GET /v1/snapshots/latest
 
 Returns the most recent snapshot for a camera, or for all cameras in a site.
+
+**In-hours only:** This endpoint returns only in-hours snapshots (those captured within the site's `working_hours`). Out-of-hours snapshots are never selected here — review them via `GET /v1/snapshots/out-of-hours`. For a single camera with no in-hours snapshot, the endpoint returns `404 NOT_FOUND`.
 
 **Query params:**
 - `site_id` (required)
@@ -186,18 +202,24 @@ If a camera has never received a snapshot, `timestamp`, `presigned_url`, and `ag
 
 Returns a paginated list of snapshots for a specific camera within a date range.
 
+**In-hours only:** This list returns only in-hours snapshots (captured within the site's `working_hours`). Out-of-hours snapshots are excluded — list them via `GET /v1/snapshots/out-of-hours`.
+
 **Query params:**
 - `site_id` (required)
 - `camera_id` (required)
 - `from` (optional, ISO8601 date or datetime, defaults to 30 days ago)
 - `to` (optional, ISO8601 date or datetime, defaults to now)
-- `limit` (optional, 1–200, default 50)
-- `cursor` (optional, opaque string from previous response)
+- `limit` (optional, 1–200, default 50) — ignored when `sample` is set
+- `sample` (optional, 1–500) — **preview mode**, see below
+- `order` (optional, `asc` | `desc`, default `desc`) — `asc` returns oldest-first, `desc` newest-first. With `limit=1`, `order=asc` gives the earliest snapshot in the range and `order=desc` the latest.
+- `cursor` (optional, opaque string from previous response) — cannot be combined with `sample`
 - `tenant_id` (required for super admins only)
 
 **Date format flexibility:**
 - Date only: `2025-06-15` (expands to start-of-day or end-of-day automatically)
 - Full datetime: `2025-06-15T14:00:00Z`
+
+**Ordering & pagination:** keep `order` constant across a cursor sequence — a `next_cursor` is tied to the direction it was issued in and can't be resumed under the opposite order.
 
 **Response (200):**
 ```json
@@ -218,7 +240,174 @@ Returns a paginated list of snapshots for a specific camera within a date range.
 
 **Pagination:** Pass `next_cursor` back as `?cursor=<value>` to get the next page. When `next_cursor` is `null`, you've reached the end. Treat cursors as opaque — never parse or construct them.
 
-**Ordering:** Results are returned newest-first (descending by timestamp).
+**Ordering:** Controlled by `order` (default `desc` = newest-first; `asc` = oldest-first).
+
+**`total_available` caveat:** in the default (non-sampled) mode this is *not* a true count of snapshots in the range — it is the number of items on the current page, plus 1 when another page exists. Treat it as a "there is more" signal, not a total. In sampled mode it is the exact number of images returned.
+
+#### Preview mode: `?sample=N`
+
+Returns up to `N` snapshots spread **evenly across the whole `from`–`to` window** instead of one contiguous page. Built for scrubber/preview UIs that need to represent an entire period without rendering a timelapse.
+
+```
+GET /v1/snapshots?site_id=site_001&camera_id=cam_01
+                 &from=2025-06-01T00:00:00Z&to=2025-06-08T00:00:00Z
+                 &sample=120&order=asc
+```
+
+How it works: the window is divided into `N` equal-width **time** buckets and the earliest snapshot in each bucket is returned. Spacing is even in *time*, not by index, so a scrubber's slider position maps linearly onto the window even when capture density varies.
+
+What this means in practice:
+- **Cost is bounded by `N`, not by how many snapshots exist.** A 7-day window with 700 snapshots and a 30-day window with 40,000 both cost `N` reads. Pick `N` to match your timeline's pixel width.
+- **You may get fewer than `N` images.** Buckets with no snapshots contribute nothing, so genuine gaps in coverage (camera offline, out-of-hours periods) stay visible rather than being silently smoothed over. Do not assume `images.length == sample`.
+- **Not paginated.** `next_cursor` is always `null`; the response already covers the whole window. Combining `sample` with `cursor` returns `400`.
+- `limit` is ignored when `sample` is set.
+- `order` still applies to the returned array (`asc` = oldest-first, recommended for a scrubber).
+
+**Additional response fields in sampled mode:**
+```json
+{
+  "images": [ /* ...same shape as above... */ ],
+  "next_cursor": null,
+  "total_available": 37,
+  "sampled": true,
+  "sample_requested": 50,
+  "window": { "from": "2025-06-01T00:00:00Z", "to": "2025-06-08T00:00:00Z" }
+}
+```
+
+- `sampled` — always `true` here; absent in the default mode, so you can tell the two responses apart.
+- `sample_requested` — the `N` you asked for (compare against `images.length` to detect coverage gaps).
+- `window` — the resolved `from`/`to` after date-only expansion and defaulting. Use these bounds, not your own request values, to position frames on a timeline.
+
+**Presigned URL expiry:** `expires_in` is `300` seconds for every image, sampled or not. A scrubber left open longer than 5 minutes will have dead image URLs. There is no batch URL-refresh endpoint — re-issue the same request to mint fresh URLs.
+
+**Relationship to rendered timelapses:** preview frames are selected by time bucket, whereas the renderer selects evenly by index across the available frames. The two sets will therefore differ where capture density is uneven. Preview mode is for *scrubbing a period*, not for previewing the exact output of `POST /v1/timelapse-jobs`.
+
+---
+
+## Out-of-Hours Snapshots
+
+Snapshots captured **outside** a site's `working_hours` are saved with a fixed **7-day (604800 s)** expiry — after that they are auto-deleted unless **promoted**. They are excluded from the default `GET /v1/snapshots` and `GET /v1/snapshots/latest` views. The flow is: **review** out-of-hours snapshots for a camera (`GET`), **promote** the ones worth keeping so they escape the 7-day expiry (`POST`), then **download** a preserved snapshot via a presigned URL (`GET`).
+
+A snapshot is identified for promote/download by its capture timestamp (`snapshot_id`), combined with `site_id` and `camera_id`.
+
+---
+
+### GET /v1/snapshots/out-of-hours
+
+Lists out-of-hours snapshots for a camera within a date range, newest-first. Same tenant/site access rules as the other snapshot endpoints.
+
+**Query params:**
+- `site_id` (required)
+- `camera_id` (required)
+- `from` (optional, `YYYY-MM-DDTHH:MM:SSZ` UTC datetime)
+- `to` (optional, `YYYY-MM-DDTHH:MM:SSZ` UTC datetime)
+- `limit` (optional, 1–200, default 50)
+- `cursor` (optional, opaque string from a previous response)
+- `tenant_id` (required for super admins only)
+
+**Date range default:** When `from`/`to` are omitted, the range covers the **30 days** immediately preceding the request. Both bounds are inclusive.
+
+**Response (200):**
+```json
+{
+  "snapshots": [
+    {
+      "snapshot_id": "2025-06-15T02:00:00Z",
+      "timestamp": "2025-06-15T02:00:00Z",
+      "camera_id": "cam_01",
+      "key": "security/acme_corp/site_001/cam_01/2025/06/15/2025-06-15T02:00:00Z.jpg",
+      "presigned_url": "https://s3.eu-west-2.amazonaws.com/...",
+      "expires_in": 300,
+      "promoted": false
+    }
+  ],
+  "next_cursor": "eyJrZXkiOiAiLi4uIn0="
+}
+```
+
+**Field notes:**
+- `snapshot_id` — the capture timestamp; pass it to promote/download.
+- `presigned_url` / `expires_in` — a temporary review URL valid for **300 seconds** (5 minutes). Do not cache beyond expiry.
+- `promoted` — `true` once the snapshot has been preserved past the 7-day expiry, `false` while it is still subject to it.
+- `next_cursor` — pass back as `?cursor=<value>` for the next page; `null` means the last page. Treat cursors as opaque.
+
+When no snapshots match, `snapshots` is an empty array with `next_cursor: null`.
+
+**Errors:**
+- 400 — missing `site_id`/`camera_id`, invalid `from`/`to` datetime, `limit` outside 1–200, malformed `cursor`, or super admin missing `tenant_id`
+- 403 — caller lacks access to the site
+
+---
+
+### POST /v1/snapshots/out-of-hours/promote
+
+Promotes ("saves") an out-of-hours snapshot so it is preserved beyond the 7-day expiry and remains downloadable. Idempotent — promoting an already-promoted snapshot is a no-op success. Same tenant/site access rules as the other snapshot endpoints.
+
+**Query params:**
+- `tenant_id` (required for super admins only)
+
+**Body:**
+```json
+{
+  "site_id": "site_001",
+  "camera_id": "cam_01",
+  "snapshot_id": "2025-06-15T02:00:00Z"
+}
+```
+
+All three fields are required.
+
+**Response (200):**
+```json
+{
+  "snapshot_id": "2025-06-15T02:00:00Z",
+  "site_id": "site_001",
+  "camera_id": "cam_01",
+  "promoted": true,
+  "key": "preserved/acme_corp/site_001/cam_01/2025/06/15/2025-06-15T02:00:00Z.jpg"
+}
+```
+
+**What happens on promotion:** The stored object is relocated from the `security/` prefix (7-day expiry) to the `preserved/` prefix (no expiry), and the snapshot's expiry timer is removed. Once promoted, the snapshot survives past the 7-day window and can be downloaded. For an already-promoted snapshot the response is returned unchanged and the `key` field may be omitted (no relocation occurs).
+
+**Errors:**
+- 400 — missing `site_id`, `camera_id`, or `snapshot_id`
+- 403 — caller lacks access to the site
+- 404 — snapshot does not exist, is not an out-of-hours snapshot, or has already expired
+- 500 — promotion did not complete; the snapshot remains under its original 7-day expiry
+
+---
+
+### GET /v1/snapshots/out-of-hours/download
+
+Returns a presigned download URL for an out-of-hours snapshot (typically one that has been promoted). Same tenant/site access rules as the other snapshot endpoints.
+
+**Query params:**
+- `site_id` (required)
+- `camera_id` (required)
+- `snapshot_id` (required — the capture timestamp)
+- `tenant_id` (required for super admins only)
+
+**Response (200):**
+```json
+{
+  "snapshot_id": "2025-06-15T02:00:00Z",
+  "camera_id": "cam_01",
+  "timestamp": "2025-06-15T02:00:00Z",
+  "key": "preserved/acme_corp/site_001/cam_01/2025/06/15/2025-06-15T02:00:00Z.jpg",
+  "presigned_url": "https://s3.eu-west-2.amazonaws.com/...",
+  "expires_in": 900,
+  "promoted": true
+}
+```
+
+**Key field: `presigned_url`** — a download URL valid for **900 seconds** (15 minutes). Mint-on-read: do not cache beyond expiry.
+
+**Errors:**
+- 400 — missing `site_id`, `camera_id`, or `snapshot_id`
+- 403 — caller lacks access to the site
+- 404 — snapshot does not exist, or has expired under the 7-day out-of-hours retention and was never promoted
 
 ---
 
@@ -1033,50 +1222,66 @@ The `not_found` field is only present if some timestamps didn't match existing r
 
 ### PATCH /v1/sites/{site_id}
 
-Updates site configuration. Currently supports setting ingest hours. **Tenant admin or super admin.**
+Updates site configuration. Supports setting `working_hours` (days of week + time window), plus `latitude`, `longitude`, and `timezone`. **Tenant admin or super admin.**
+
+> **Renamed from `ingest_hours`.** The old `ingest_hours` field has been replaced by `working_hours`, which adds a `days` array. Sending `ingest_hours` now returns `400 BAD_REQUEST`. See the migration note below.
 
 **Query params:**
 - `tenant_id` (required for super admins; tenant admins use their own tenant from JWT)
 
-**Body — set ingest hours:**
+**Body — set working hours:**
 ```json
 {
-  "ingest_hours": {
+  "working_hours": {
+    "days": ["mon", "tue", "wed", "thu", "fri"],
     "start": "07:00",
     "end": "18:00"
   }
 }
 ```
 
-**Body — clear ingest hours (allow all hours):**
+**Body — clear working hours (treat all snapshots as in-hours):**
 ```json
 {
-  "ingest_hours": null
+  "working_hours": null
 }
 ```
 
 **Field rules:**
-- `ingest_hours` — object with `start` and `end` in HH:MM format (24-hour), or `null` to clear
-- `start` and `end` must be different
-- Supports overnight windows (e.g. `start: "22:00"`, `end: "06:00"`)
+- `working_hours` — an object with `start`, `end`, and optional `days`, or `null` to clear
+- `start` — required, HH:MM 24-hour format in the range `00:00`–`23:59`
+- `end` — required, HH:MM 24-hour format in the range `00:00`–`23:59`
+- `days` — optional, a list of 1–7 entries drawn from the lowercase set `{mon, tue, wed, thu, fri, sat, sun}`, with no duplicates. Entries must be exact-lowercase (`"Mon"` is rejected).
+- When `days` is omitted, it defaults to all seven days
+- Supports overnight windows (e.g. `start: "22:00"`, `end: "06:00"`), anchored to the day on which the window begins
 - Times are interpreted in the site's configured timezone
+- You may also update `latitude` (float, -90–90), `longitude` (float, -180–180), and `timezone` (valid IANA identifier) in the same request
 
 **Response (200):**
 ```json
 {
   "site_id": "site_001",
   "tenant_id": "acme_corp",
-  "ingest_hours": {
+  "working_hours": {
+    "days": ["mon", "tue", "wed", "thu", "fri"],
     "start": "07:00",
     "end": "18:00"
   }
 }
 ```
 
-**Behaviour:** When ingest hours are configured, the ingest endpoint (`POST /v1/ingest/{token}`) still accepts requests at any time (returns 200) but only saves the image to S3/DynamoDB if the current time (in the site's timezone) falls within the configured window. Outside the window, the ingest response includes `"status": "skipped"` instead of the usual `key`/`sha256` fields.
+The response echoes only the fields that were updated. When `working_hours` is cleared with `null`, the field is omitted from the response.
+
+**Behaviour — 24/7 ingestion with retention classes:** Snapshots are now saved **24 hours a day**, at the existing 15-minute cadence — working hours no longer decide *whether* an image is saved, only how long it is retained:
+- **In-hours** (captured within `working_hours`, evaluated in the site timezone) — long-term timelapse retention. These appear in `GET /v1/snapshots` and `GET /v1/snapshots/latest`.
+- **Out-of-hours** (captured outside `working_hours`) — a fixed **7-day** expiry, after which they are auto-deleted unless promoted. These are excluded from the default list/latest views and are accessed via the out-of-hours endpoints (review / promote / download) documented below.
+
+When `working_hours` is `null`, every snapshot is treated as in-hours. The fixed 7-day out-of-hours retention is **not configurable** — attempting to set any out-of-hours TTL field returns `400 BAD_REQUEST`.
+
+**Migration note:** Existing sites still stored with the legacy `ingest_hours` attribute keep working — the API reads them transparently and surfaces them as `working_hours` with `days` defaulted to all seven days. The next successful `working_hours` write removes the legacy attribute. Clients should send and read `working_hours` only.
 
 **Errors:**
-- 400 — invalid time format, start equals end, missing fields
+- 400 — `ingest_hours` field sent (use `working_hours`), invalid `start`/`end` format or range, missing `start`/`end`, invalid `days` (empty, >7, duplicate, unknown, or wrong case), attempt to configure the out-of-hours TTL, or super admin missing `tenant_id`
 - 403 — caller is a regular user
 - 404 — site does not exist
 

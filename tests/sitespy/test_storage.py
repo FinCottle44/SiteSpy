@@ -352,3 +352,161 @@ class TestTimelapseArtifactExists:
         with pytest.raises(ClientError) as exc_info:
             timelapse_artifact_exists(key)
         assert exc_info.value.response["Error"]["Code"] == "InternalError"
+
+
+# ===========================================================================
+# Out-of-hours storage: put_out_of_hours_snapshot / promote_object / object_exists
+# Feature: working-hours-retention (task 2.2)
+# Requirements validated: 5.4, 5.5, 9.3, 10.1
+# ===========================================================================
+from sitespy.storage import (
+    build_out_of_hours_key,
+    build_preserved_key,
+    object_exists,
+    promote_object,
+    put_out_of_hours_snapshot,
+)
+
+
+class TestPutOutOfHoursSnapshot:
+    """put_out_of_hours_snapshot writes the object with integrity metadata and
+    no retention tag — cleanup is lifecycle-managed like ``live/`` (Req 5.5)."""
+
+    @mock_aws
+    def test_no_retention_tag(self):
+        """put_out_of_hours_snapshot applies no retention tag to the S3 object."""
+        os.environ.setdefault("SNAPSHOTS_BUCKET", "test-snapshots-bucket")
+        os.environ.setdefault("AWS_REGION", "eu-west-2")
+
+        client = boto3.client("s3", region_name="eu-west-2")
+        _create_bucket(client)
+
+        key = build_out_of_hours_key("acme", "site_01", "cam_01", "2025-06-15T02:00:00Z")
+        body = b"\xff\xd8\xff\xe0" + b"\x00" * 100
+
+        put_out_of_hours_snapshot(key, body, "abc123", "2025-06-15T02:00:00Z", "acme")
+
+        tag_response = client.get_object_tagging(
+            Bucket="test-snapshots-bucket", Key=key
+        )
+        assert tag_response["TagSet"] == []
+
+    @mock_aws
+    def test_integrity_metadata_and_content_type(self):
+        """Object carries sha256 / captured-at / tenant-id metadata and jpeg type."""
+        os.environ.setdefault("SNAPSHOTS_BUCKET", "test-snapshots-bucket")
+        os.environ.setdefault("AWS_REGION", "eu-west-2")
+
+        client = boto3.client("s3", region_name="eu-west-2")
+        _create_bucket(client)
+
+        key = build_out_of_hours_key("acme", "site_01", "cam_01", "2025-06-15T02:00:00Z")
+        body = b"\xff\xd8\xff\xe0" + b"\x00" * 100
+        sha256_hex = "deadbeef"
+        snapshot_ts = "2025-06-15T02:00:00Z"
+
+        put_out_of_hours_snapshot(key, body, sha256_hex, snapshot_ts, "acme")
+
+        response = client.head_object(Bucket="test-snapshots-bucket", Key=key)
+        assert response["ContentType"] == "image/jpeg"
+        assert response["Metadata"]["sha256"] == sha256_hex
+        assert response["Metadata"]["captured-at"] == snapshot_ts
+        assert response["Metadata"]["tenant-id"] == "acme"
+
+
+class TestPromoteObject:
+    """promote_object copies the source object to the destination then deletes
+    the source (Req 9.3)."""
+
+    @mock_aws
+    def test_copies_then_deletes_source(self):
+        """After promotion the object exists at dest and is gone from source."""
+        os.environ.setdefault("SNAPSHOTS_BUCKET", "test-snapshots-bucket")
+        os.environ.setdefault("AWS_REGION", "eu-west-2")
+
+        client = boto3.client("s3", region_name="eu-west-2")
+        _create_bucket(client)
+
+        ts = "2025-06-15T02:00:00Z"
+        source_key = build_out_of_hours_key("acme", "site_01", "cam_01", ts)
+        dest_key = build_preserved_key("acme", "site_01", "cam_01", ts)
+        body = b"\xff\xd8\xff\xe0" + b"\x00" * 100
+
+        put_out_of_hours_snapshot(source_key, body, "abc123", ts, "acme")
+
+        promote_object(source_key, dest_key)
+
+        # Destination object exists and carries the copied body.
+        dest = client.get_object(Bucket="test-snapshots-bucket", Key=dest_key)
+        assert dest["Body"].read() == body
+
+        # Source object has been deleted.
+        with pytest.raises(ClientError) as exc_info:
+            client.head_object(Bucket="test-snapshots-bucket", Key=source_key)
+        assert exc_info.value.response["Error"]["Code"] in ("404", "NoSuchKey", "NotFound")
+
+
+class TestObjectExists:
+    """object_exists — HeadObject existence check mirroring
+    timelapse_artifact_exists (Req 10.1).
+
+    - Existing object -> True
+    - Missing object (404 / NoSuchKey) -> False
+    - Unexpected (non-404) S3 error propagates
+    """
+
+    @mock_aws
+    def test_returns_true_when_object_exists(self):
+        """An existing object returns True."""
+        os.environ.setdefault("SNAPSHOTS_BUCKET", "test-snapshots-bucket")
+        os.environ.setdefault("AWS_REGION", "eu-west-2")
+
+        client = boto3.client("s3", region_name="eu-west-2")
+        _create_bucket(client)
+
+        key = build_preserved_key("acme", "site_01", "cam_01", "2025-06-15T02:00:00Z")
+        put_out_of_hours_snapshot(
+            key, b"\xff\xd8\xff\xe0" + b"\x00" * 100, "abc123", "2025-06-15T02:00:00Z", "acme"
+        )
+
+        assert object_exists(key) is True
+
+    @mock_aws
+    def test_returns_false_when_object_missing(self):
+        """A missing object (404 / NoSuchKey) returns False."""
+        os.environ.setdefault("SNAPSHOTS_BUCKET", "test-snapshots-bucket")
+        os.environ.setdefault("AWS_REGION", "eu-west-2")
+
+        client = boto3.client("s3", region_name="eu-west-2")
+        _create_bucket(client)
+
+        key = build_preserved_key("acme", "site_01", "cam_01", "2025-06-15T02:00:00Z")
+
+        assert object_exists(key) is False
+
+    def test_unexpected_s3_error_propagates(self, monkeypatch):
+        """A non-404 S3 error (e.g. 500 InternalError) propagates to the caller."""
+        os.environ.setdefault("SNAPSHOTS_BUCKET", "test-snapshots-bucket")
+        os.environ.setdefault("AWS_REGION", "eu-west-2")
+
+        class _RaisingClient:
+            def head_object(self, **_kwargs):
+                raise ClientError(
+                    {
+                        "Error": {
+                            "Code": "InternalError",
+                            "Message": "We encountered an internal error.",
+                        }
+                    },
+                    "HeadObject",
+                )
+
+        from sitespy import storage as storage_module
+
+        monkeypatch.setattr(storage_module, "_s3_client", lambda: _RaisingClient())
+
+        key = build_preserved_key("acme", "site_01", "cam_01", "2025-06-15T02:00:00Z")
+
+        with pytest.raises(ClientError) as exc_info:
+            object_exists(key)
+        assert exc_info.value.response["Error"]["Code"] == "InternalError"

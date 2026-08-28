@@ -413,6 +413,74 @@ class TestSnapshotsListValidation:
 # ---------------------------------------------------------------------------
 
 
+class TestSnapshotsListOrder:
+    def test_default_order_is_descending(self):
+        """Omitting order queries newest-first (ascending=False)."""
+        event = _make_event()  # no order param
+        with (
+            patch("sitespy.data.get_site", return_value=_SITE_ITEM),
+            patch(
+                "sitespy.data.list_img_records", return_value=([], None)
+            ) as mock_list,
+            patch("sitespy.storage.generate_presigned_url", return_value=_PRESIGNED_URL),
+        ):
+            result = handler_list(event, MagicMock())
+
+        assert result["statusCode"] == 200
+        assert mock_list.call_args.kwargs["ascending"] is False
+
+    def test_order_desc_is_descending(self):
+        event = _make_event(extra_query_params={"order": "desc"})
+        with (
+            patch("sitespy.data.get_site", return_value=_SITE_ITEM),
+            patch(
+                "sitespy.data.list_img_records", return_value=([], None)
+            ) as mock_list,
+            patch("sitespy.storage.generate_presigned_url", return_value=_PRESIGNED_URL),
+        ):
+            result = handler_list(event, MagicMock())
+
+        assert result["statusCode"] == 200
+        assert mock_list.call_args.kwargs["ascending"] is False
+
+    def test_order_asc_is_ascending(self):
+        event = _make_event(extra_query_params={"order": "asc"})
+        with (
+            patch("sitespy.data.get_site", return_value=_SITE_ITEM),
+            patch(
+                "sitespy.data.list_img_records", return_value=([], None)
+            ) as mock_list,
+            patch("sitespy.storage.generate_presigned_url", return_value=_PRESIGNED_URL),
+        ):
+            result = handler_list(event, MagicMock())
+
+        assert result["statusCode"] == 200
+        assert mock_list.call_args.kwargs["ascending"] is True
+
+    def test_order_is_case_insensitive(self):
+        event = _make_event(extra_query_params={"order": "ASC"})
+        with (
+            patch("sitespy.data.get_site", return_value=_SITE_ITEM),
+            patch(
+                "sitespy.data.list_img_records", return_value=([], None)
+            ) as mock_list,
+            patch("sitespy.storage.generate_presigned_url", return_value=_PRESIGNED_URL),
+        ):
+            result = handler_list(event, MagicMock())
+
+        assert result["statusCode"] == 200
+        assert mock_list.call_args.kwargs["ascending"] is True
+
+    def test_invalid_order_returns_400(self):
+        event = _make_event(extra_query_params={"order": "sideways"})
+        with patch("sitespy.data.get_site", return_value=_SITE_ITEM):
+            result = handler_list(event, MagicMock())
+        assert result["statusCode"] == 400
+        body = json.loads(result["body"])
+        assert body["error"] == "BAD_REQUEST"
+        assert "order" in body["message"]
+
+
 class TestSnapshotsListAccessControl:
     def test_tenant_admin_allowed(self):
         event = _make_event(groups="TenantAdmins", tenant_id="acme_corp")

@@ -15,6 +15,7 @@ from typing import Any
 import boto3
 import botocore.config
 
+from sitespy import retention
 from sitespy.config import get_settings
 from sitespy.timelapse import build_job_sk
 
@@ -323,11 +324,19 @@ def list_img_records(
     to_ts: str,
     limit: int = 50,
     exclusive_start_key: dict | None = None,
+    ascending: bool = False,
 ) -> tuple[list[Mapping[str, Any]], dict | None]:
     """Query IMG# records for a camera within a time range.
 
     Returns (items, last_evaluated_key).
     last_evaluated_key is None when there are no more pages.
+
+    Args:
+        ascending: When True, return oldest capture first (``ScanIndexForward``
+            True); when False (default), newest first, preserving the historical
+            default ordering. A pagination cursor is tied to the direction it
+            was produced in, so ``ascending`` must stay constant across a cursor
+            sequence.
 
     Requirements: 4.4, 4.5, 4.7
     """
@@ -342,7 +351,7 @@ def list_img_records(
             ":sk_from": {"S": sk_from},
             ":sk_to": {"S": sk_to},
         },
-        "ScanIndexForward": False,
+        "ScanIndexForward": ascending,
         "Limit": limit,
     }
     if exclusive_start_key:
@@ -586,6 +595,7 @@ def put_img_record(
     sha256_hex: str,
     size_bytes: int,
     weather: dict[str, dict[str, str]] | None = None,
+    retention_class: str | None = None,
 ) -> None:
     """Write an IMG# record to DynamoDB (unconditional PutItem).
 
@@ -593,8 +603,12 @@ def put_img_record(
 
     Args:
         weather: Optional DynamoDB map attribute (from weather_to_dynamo_map).
+        retention_class: Optional retention class string. When provided (e.g.
+            ``"In_Hours"``) it is recorded on the item so the record carries the
+            class assigned by the classifier (Req 5.6, Property 11). Defaults to
+            ``None`` to preserve prior behavior.
 
-    Requirements: 6.1, 6.2, 7.2
+    Requirements: 5.6, 6.1, 6.2, 7.2
     """
     item: dict[str, Any] = {
         "PK": {"S": build_tenant_pk(tenant_id)},
@@ -607,11 +621,270 @@ def put_img_record(
     }
     if weather is not None:
         item["weather"] = weather
+    if retention_class is not None:
+        item["retention_class"] = {"S": retention_class}
 
     _dynamodb_client().put_item(
         TableName=get_settings().data_table,
         Item=item,
     )
+
+
+# ---------------------------------------------------------------------------
+# Out-of-hours snapshot records (OOH_IMG# — working-hours-retention feature)
+# ---------------------------------------------------------------------------
+#
+# Out-of-hours snapshots are stored under a distinct SK prefix (``OOH_IMG#``)
+# so the existing ``IMG#`` list/latest queries exclude them automatically
+# (Req 11.1/11.2). Each record carries a ``ttl`` for the fixed 7-day expiry
+# (Req 7.1) until it is promoted, at which point the ``ttl`` is removed
+# (Req 9.2).
+
+
+def build_out_of_hours_img_sk(site_id: str, camera_id: str, snapshot_ts: str) -> str:
+    """Build the DynamoDB sort key for an OOH_IMG# (out-of-hours) record.
+
+    Returns: ``OOH_IMG#<site_id>#<camera_id>#<snapshot_ts>``
+    """
+    return f"OOH_IMG#{site_id}#{camera_id}#{snapshot_ts}"
+
+
+def put_out_of_hours_img_record(
+    tenant_id: str,
+    site_id: str,
+    camera_id: str,
+    snapshot_ts: str,
+    s3_key: str,
+    sha256_hex: str,
+    size_bytes: int,
+    ttl: int,
+) -> None:
+    """Write an OOH_IMG# (out-of-hours) record to DynamoDB (unconditional PutItem).
+
+    Record schema:
+
+    +----------------+-------+---------------------------------------------+
+    | Attribute      | Type  | Value                                       |
+    +================+=======+=============================================+
+    | PK             | S     | TENANT#<tenant_id>                          |
+    | SK             | S     | OOH_IMG#<site_id>#<camera_id>#<ts>          |
+    | s3_key         | S     | security/<tenant>/<site>/<cam>/.../<ts>.jpg |
+    | sha256         | S     | hex SHA-256 of the JPEG body                |
+    | size_bytes     | N     | byte length of the JPEG body                |
+    | ingested_at    | S     | ISO 8601 UTC capture timestamp (<ts>)       |
+    | content_type   | S     | image/jpeg                                  |
+    | retention_class| S     | Out_Of_Hours                                |
+    | ttl            | N     | epoch(capture_ts) + 604800 (Req 7.1)        |
+    | promoted       | BOOL  | false at write time (Req 9.1)               |
+    +----------------+-------+---------------------------------------------+
+
+    No ConditionExpression — duplicates overwrite (idempotent, mirrors
+    ``put_img_record``).
+
+    Requirements: 5.6, 6.5, 7.1
+    """
+    item: dict[str, Any] = {
+        "PK": {"S": build_tenant_pk(tenant_id)},
+        "SK": {"S": build_out_of_hours_img_sk(site_id, camera_id, snapshot_ts)},
+        "s3_key": {"S": s3_key},
+        "sha256": {"S": sha256_hex},
+        "size_bytes": {"N": str(size_bytes)},
+        "ingested_at": {"S": snapshot_ts},
+        "content_type": {"S": "image/jpeg"},
+        "retention_class": {"S": retention.RetentionClass.OUT_OF_HOURS.value},
+        "ttl": {"N": str(ttl)},
+        "promoted": {"BOOL": False},
+    }
+
+    _dynamodb_client().put_item(
+        TableName=get_settings().data_table,
+        Item=item,
+    )
+
+
+def get_out_of_hours_img_record(
+    tenant_id: str,
+    site_id: str,
+    camera_id: str,
+    snapshot_ts: str,
+) -> Mapping[str, Any] | None:
+    """Fetch a single OOH_IMG# record by its exact PK/SK.
+
+    Returns None if the item does not exist.
+
+    Requirements: 9.1, 9.4, 10.2
+    """
+    response: dict[str, Any] = _dynamodb_client().get_item(
+        TableName=get_settings().data_table,
+        Key={
+            "PK": {"S": build_tenant_pk(tenant_id)},
+            "SK": {"S": build_out_of_hours_img_sk(site_id, camera_id, snapshot_ts)},
+        },
+    )
+    return response.get("Item")
+
+
+def get_latest_out_of_hours_img_record(
+    tenant_id: str,
+    site_id: str,
+    camera_id: str,
+) -> Mapping[str, Any] | None:
+    """Fetch the most recent OOH_IMG# record for a camera.
+
+    Queries PK=TENANT#<tenant_id> with SK begins_with OOH_IMG#<site_id>#<camera_id>#,
+    sorted descending, limit 1.  Returns None if no records exist.
+    """
+    sk_prefix = f"OOH_IMG#{site_id}#{camera_id}#"
+    response: dict[str, Any] = _dynamodb_client().query(
+        TableName=get_settings().data_table,
+        KeyConditionExpression="PK = :pk AND begins_with(SK, :sk_prefix)",
+        ExpressionAttributeValues={
+            ":pk": {"S": build_tenant_pk(tenant_id)},
+            ":sk_prefix": {"S": sk_prefix},
+        },
+        ScanIndexForward=False,
+        Limit=1,
+    )
+    items = response.get("Items", [])
+    return items[0] if items else None
+
+
+def list_out_of_hours_img_records(
+    tenant_id: str,
+    site_id: str,
+    camera_id: str,
+    from_ts: str,
+    to_ts: str,
+    limit: int = 50,
+    exclusive_start_key: dict | None = None,
+) -> tuple[list[Mapping[str, Any]], dict | None]:
+    """Query OOH_IMG# records for a camera within an inclusive time range.
+
+    Uses ``begins_with(SK, "OOH_IMG#<site>#<cam>#")`` implicitly via a
+    ``BETWEEN`` bound on the fully-qualified SKs, ordered newest capture time
+    first (``ScanIndexForward=False``). Both ``from_ts`` and ``to_ts`` are
+    inclusive.
+
+    Returns (items, last_evaluated_key). last_evaluated_key is None when there
+    are no more pages.
+
+    Requirements: 8.1
+    """
+    sk_from = f"OOH_IMG#{site_id}#{camera_id}#{from_ts}"
+    sk_to = f"OOH_IMG#{site_id}#{camera_id}#{to_ts}"
+
+    kwargs: dict[str, Any] = {
+        "TableName": get_settings().data_table,
+        "KeyConditionExpression": "PK = :pk AND SK BETWEEN :sk_from AND :sk_to",
+        "ExpressionAttributeValues": {
+            ":pk": {"S": build_tenant_pk(tenant_id)},
+            ":sk_from": {"S": sk_from},
+            ":sk_to": {"S": sk_to},
+        },
+        "ScanIndexForward": False,
+        "Limit": limit,
+    }
+    if exclusive_start_key:
+        kwargs["ExclusiveStartKey"] = exclusive_start_key
+
+    response = _dynamodb_client().query(**kwargs)
+    return response.get("Items", []), response.get("LastEvaluatedKey")
+
+
+def promote_out_of_hours_record(
+    tenant_id: str,
+    ooh_sk: str,
+    new_s3_key: str,
+    promoted_at: str,
+) -> None:
+    """Commit the promotion of an OOH_IMG# record.
+
+    Sets ``s3_key`` to the preserved-prefix key, marks ``promoted=true`` with
+    a ``promoted_at`` timestamp, and REMOVEs the ``ttl`` attribute so the
+    record is no longer auto-expired by the table TimeToLive specification
+    (Req 9.1/9.2). Guarded by ``attribute_exists(SK)`` so a vanished record
+    raises ConditionalCheckFailedException rather than creating a new item.
+
+    Requirements: 9.1, 9.2
+    """
+    _dynamodb_client().update_item(
+        TableName=get_settings().data_table,
+        Key={
+            "PK": {"S": build_tenant_pk(tenant_id)},
+            "SK": {"S": ooh_sk},
+        },
+        UpdateExpression=(
+            "SET s3_key = :s3_key, promoted = :promoted,"
+            " promoted_at = :promoted_at REMOVE #ttl"
+        ),
+        ConditionExpression="attribute_exists(SK)",
+        ExpressionAttributeNames={"#ttl": "ttl"},
+        ExpressionAttributeValues={
+            ":s3_key": {"S": new_s3_key},
+            ":promoted": {"BOOL": True},
+            ":promoted_at": {"S": promoted_at},
+        },
+    )
+
+
+def get_latest_any_img_record(
+    tenant_id: str,
+    site_id: str,
+    camera_id: str,
+) -> Mapping[str, Any] | None:
+    """Fetch the most recent saved snapshot across both retention classes.
+
+    Returns whichever of the latest ``IMG#`` (In_Hours) and latest
+    ``OOH_IMG#`` (Out_Of_Hours) records has the greater ``ingested_at``, so
+    the ingest cadence can be enforced irrespective of retention class
+    (Req 4.2). Returns None when the camera has no saved snapshot of either
+    class.
+    """
+    candidates: list[Mapping[str, Any]] = []
+    latest_in_hours = get_latest_img_record(tenant_id, site_id, camera_id)
+    if latest_in_hours is not None:
+        candidates.append(latest_in_hours)
+    latest_out_of_hours = get_latest_out_of_hours_img_record(
+        tenant_id, site_id, camera_id
+    )
+    if latest_out_of_hours is not None:
+        candidates.append(latest_out_of_hours)
+
+    if not candidates:
+        return None
+
+    return max(
+        candidates,
+        key=lambda record: record.get("ingested_at", {}).get("S", ""),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Working-hours attribute resolution for GET responses
+# ---------------------------------------------------------------------------
+
+
+def resolve_working_hours_attr(site_item: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Resolve a site record's working hours for GET responses.
+
+    Returns a JSON-serialisable ``{"days": [...], "start": "HH:MM",
+    "end": "HH:MM"}`` dict, or ``None`` when no usable configuration exists.
+    Applies the same backward-compatible resolution as the classifier,
+    including derivation from a valid legacy ``ingest_hours`` attribute as all
+    seven days, without mutating the stored record (Req 2.1/2.2).
+
+    Requirements: 2.1, 2.2
+    """
+    working_hours = retention.resolve_working_hours(site_item)
+    if working_hours is None:
+        return None
+    # Emit days in canonical Monday-based order for a deterministic response.
+    ordered_days = [day for day in retention.DAYS if day in working_hours.days]
+    return {
+        "days": ordered_days,
+        "start": working_hours.start,
+        "end": working_hours.end,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -994,67 +1267,70 @@ def update_site(
 ) -> None:
     """Update one or more attributes on a site record.
 
-    Supported fields: ingest_hours, latitude, longitude, timezone.
-    Builds a dynamic UpdateExpression based on which fields are present.
+    Supported fields: working_hours, ingest_hours, latitude, longitude,
+    timezone. Builds a dynamic UpdateExpression based on which fields are
+    present:
+
+    - A field with a non-None value is written with a ``SET`` clause.
+    - A field with a ``None`` value is removed with a ``REMOVE`` clause
+      (e.g. ``working_hours=None`` removes the attribute — Req 1.2).
+    - Writing a non-None ``working_hours`` value additionally removes any
+      legacy ``ingest_hours`` attribute in the same call so the persisted
+      record retains only ``working_hours`` (Req 2.4).
     """
-    # Handle ingest_hours separately (it has remove logic)
-    if "ingest_hours" in updates and updates["ingest_hours"] is None:
-        # Remove ingest_hours, then process remaining fields
-        remaining = {k: v for k, v in updates.items() if k != "ingest_hours"}
-        if remaining:
-            # Build SET + REMOVE in one call
-            set_parts: list[str] = []
-            attr_values: dict[str, Any] = {}
-            for key, value in remaining.items():
-                placeholder = f":val_{key}"
-                set_parts.append(f"{key} = {placeholder}")
-                attr_values[placeholder] = _to_dynamo_value(key, value)
-
-            _dynamodb_client().update_item(
-                TableName=get_settings().data_table,
-                Key={
-                    "PK": {"S": build_tenant_pk(tenant_id)},
-                    "SK": {"S": build_site_sk(site_id)},
-                },
-                UpdateExpression=f"SET {', '.join(set_parts)} REMOVE ingest_hours",
-                ExpressionAttributeValues=attr_values,
-            )
-        else:
-            _dynamodb_client().update_item(
-                TableName=get_settings().data_table,
-                Key={
-                    "PK": {"S": build_tenant_pk(tenant_id)},
-                    "SK": {"S": build_site_sk(site_id)},
-                },
-                UpdateExpression="REMOVE ingest_hours",
-            )
-        return
-
-    # All fields are SET operations
-    set_parts = []
+    set_parts: list[str] = []
     attr_values: dict[str, Any] = {}
+    remove_keys: list[str] = []
 
     for key, value in updates.items():
-        placeholder = f":val_{key}"
-        set_parts.append(f"{key} = {placeholder}")
-        attr_values[placeholder] = _to_dynamo_value(key, value)
+        if value is None:
+            if key not in remove_keys:
+                remove_keys.append(key)
+        else:
+            placeholder = f":val_{key}"
+            set_parts.append(f"{key} = {placeholder}")
+            attr_values[placeholder] = _to_dynamo_value(key, value)
 
-    if not set_parts:
+    # Writing a working_hours value migrates away the legacy ingest_hours
+    # attribute within the same write operation (Req 2.4).
+    writes_working_hours = updates.get("working_hours") is not None
+    if writes_working_hours and "ingest_hours" not in remove_keys:
+        remove_keys.append("ingest_hours")
+
+    clauses: list[str] = []
+    if set_parts:
+        clauses.append(f"SET {', '.join(set_parts)}")
+    if remove_keys:
+        clauses.append(f"REMOVE {', '.join(remove_keys)}")
+
+    if not clauses:
         return
 
-    _dynamodb_client().update_item(
-        TableName=get_settings().data_table,
-        Key={
+    kwargs: dict[str, Any] = {
+        "TableName": get_settings().data_table,
+        "Key": {
             "PK": {"S": build_tenant_pk(tenant_id)},
             "SK": {"S": build_site_sk(site_id)},
         },
-        UpdateExpression=f"SET {', '.join(set_parts)}",
-        ExpressionAttributeValues=attr_values,
-    )
+        "UpdateExpression": " ".join(clauses),
+    }
+    if attr_values:
+        kwargs["ExpressionAttributeValues"] = attr_values
+
+    _dynamodb_client().update_item(**kwargs)
 
 
 def _to_dynamo_value(key: str, value: Any) -> dict[str, Any]:
     """Convert a Python value to its DynamoDB attribute representation."""
+    if key == "working_hours" and isinstance(value, dict):
+        m: dict[str, Any] = {
+            "start": {"S": value["start"]},
+            "end": {"S": value["end"]},
+        }
+        days = value.get("days")
+        if days is not None:
+            m["days"] = {"L": [{"S": str(day)} for day in days]}
+        return {"M": m}
     if key == "ingest_hours" and isinstance(value, dict):
         return {
             "M": {

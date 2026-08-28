@@ -279,52 +279,56 @@ fi
 echo ""
 
 # ─── List prod snapshots ─────────────────────────────────────────────────────
+# Snapshot keys look like:
+#   <tenant>/<site>/<camera>/YYYY/MM/DD/<snapshot_ts>.jpg
+#
+# S3 only ever lists keys in ascending binary order, and that layout sorts
+# chronologically — so the NEWEST keys are at the END of the listing. There is
+# no "newest first" option in the S3 API.
+#
+# Do NOT add --max-items here: it truncates from the OLDEST end, so the script
+# would pick the newest of the oldest N keys and silently stall weeks behind.
+# List the prefix in full (the CLI paginates, ~1 request per 1000 keys) and
+# take the tail.
 echo -n "Listing snapshots from prod... "
 
 S3_PREFIX="${SOURCE_TENANT}/${SOURCE_SITE}/${SOURCE_CAMERA}/"
 
-RAW_JSON=$(aws s3api list-objects-v2 \
+ALL_KEYS=$(aws s3api list-objects-v2 \
   --bucket "$PROD_BUCKET" \
   --prefix "$S3_PREFIX" \
-  --max-items 1000 \
   --region "$REGION" \
   --profile "$PROFILE" \
-  --output json 2>&1)
+  --query 'Contents[].Key' \
+  --output text 2>/dev/null | tr '\t' '\n' | grep '\.jpg$' | sort || true)
 
-KEYS=$(echo "$RAW_JSON" | jq -r '
-  if .Contents then
-    [.Contents | sort_by(.LastModified) | reverse | .[:'$COUNT'] | .[].Key] | .[]
-  else
-    empty
-  end
-' 2>/dev/null)
+# Optional --days cutoff, compared against the capture timestamp in the
+# filename. Applied before taking the tail so it bounds how far back we reach
+# rather than just trimming the result.
+if [ -n "$DAYS" ]; then
+  CUTOFF_DATE=$(date -u -v-${DAYS}d +%Y-%m-%d 2>/dev/null \
+    || date -u -d "-${DAYS} days" +%Y-%m-%d)
+  ALL_KEYS=$(echo "$ALL_KEYS" \
+    | awk -F/ -v cutoff="$CUTOFF_DATE" 'substr($NF, 1, 10) >= cutoff')
+fi
+
+# Newest $COUNT keys, newest first.
+KEYS=$(echo "$ALL_KEYS" | sed '/^$/d' | tail -n "$COUNT" | sort -r)
 
 if [ -z "$KEYS" ]; then
   echo -e "${RED}FAILED${NC}"
-  echo "No snapshots found under s3://$PROD_BUCKET/$S3_PREFIX"
+  if [ -n "$DAYS" ]; then
+    echo "No snapshots in the last $DAYS days under s3://$PROD_BUCKET/$S3_PREFIX"
+  else
+    echo "No snapshots found under s3://$PROD_BUCKET/$S3_PREFIX"
+  fi
   exit 1
 fi
 
-# Filter by --days if specified
-if [ -n "$DAYS" ]; then
-  CUTOFF_DATE=$(date -v-${DAYS}d +%Y-%m-%d 2>/dev/null || date -d "-${DAYS} days" +%Y-%m-%d)
-  FILTERED_KEYS=""
-  while IFS= read -r key; do
-    FILENAME=$(basename "$key" .jpg)
-    FILE_DATE="${FILENAME:0:10}"
-    if [[ "$FILE_DATE" > "$CUTOFF_DATE" || "$FILE_DATE" == "$CUTOFF_DATE" ]]; then
-      FILTERED_KEYS="${FILTERED_KEYS}${key}"$'\n'
-    fi
-  done <<< "$KEYS"
-  KEYS=$(echo "$FILTERED_KEYS" | sed '/^$/d')
-  if [ -z "$KEYS" ]; then
-    echo -e "${RED}No snapshots in the last $DAYS days${NC}"
-    exit 1
-  fi
-fi
-
 KEY_COUNT=$(echo "$KEYS" | wc -l | tr -d ' ')
-echo -e "${GREEN}found $KEY_COUNT${NC}"
+NEWEST_TS=$(basename "$(echo "$KEYS" | head -1)" .jpg)
+OLDEST_TS=$(basename "$(echo "$KEYS" | tail -1)" .jpg)
+echo -e "${GREEN}found $KEY_COUNT${NC} ${DIM}($OLDEST_TS → $NEWEST_TS)${NC}"
 
 # ─── Copy snapshots ─────────────────────────────────────────────────────────
 echo ""

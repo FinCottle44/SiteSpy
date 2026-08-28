@@ -8,10 +8,16 @@ Once the company exists and you have insurance, lock down the legal and data pro
 
 - [ ] Draft a DPA between your company and the tenant
 - [ ] Must cover: what personal data you process, why, how long you keep it, security measures, breach notification (72h), sub-processors (AWS)
-- [ ] The ICO has template clauses: https://ico.org.uk/for-organisations/
 - [ ] Get it signed alongside the subscription agreement
 
+**Where to get it:**
+- **ICO** (ico.org.uk/for-organisations) — free controller/processor contract guidance and template clauses. Start here.
+- **Docular / SEQ Legal** (docular.net) — free/cheap UK-drafted DPA templates you can adapt.
+- **Solicitor** — worth a review if the client is large or pushes back on terms.
+
 **Why:** UK GDPR requires this whenever you process personal data on behalf of another controller. Without it, both you and your client are non-compliant.
+
+**Note:** Can be signed now as a sole trader — this is a live compliance gap with your current client, so don't wait for the Ltd. Reissue under the Ltd when it exists.
 
 ---
 
@@ -21,6 +27,11 @@ Once the company exists and you have insurance, lock down the legal and data pro
 - [ ] Cover: what data you collect (names, emails, IP addresses, images), lawful basis, retention periods, user rights (access, deletion, portability), your ICO registration number
 - [ ] Keep it plain English, not legalese
 
+**Where to get it:**
+- **Termly** (termly.io) or **iubenda** (iubenda.com) — free/low-cost privacy policy generators that produce a GDPR-compliant policy from a questionnaire. Fastest route.
+- **Docular / SEQ Legal** (docular.net) — free UK-drafted templates if you'd rather edit a document than use a generator.
+- **ICO** (ico.org.uk) — guidance on what a privacy notice must contain (use to sanity-check whatever you generate).
+
 **Why:** Legal requirement for any service collecting personal data. Also signals to your client's users that their data is handled properly.
 
 ---
@@ -29,6 +40,10 @@ Once the company exists and you have insurance, lock down the legal and data pro
 
 - [ ] Basic ToS for dashboard users covering: acceptable use, account responsibilities, intellectual property, limitation of liability
 - [ ] Doesn't need to be long — 1–2 pages is fine at this stage
+
+**Where to get it:**
+- **Termly / iubenda** — same generators as the privacy policy; they produce a matching ToS.
+- **Docular / SEQ Legal** — free "website terms of use" / SaaS terms templates.
 
 **Why:** Protects you if a user does something unexpected with the platform.
 
@@ -42,6 +57,11 @@ Once the company exists and you have insurance, lock down the legal and data pro
   - Steps to contain and remediate
   - Post-incident review
 - [ ] Store it in `requirements/` or a dedicated `operations/` folder
+
+**Where to get it:**
+- **NCSC** (ncsc.gov.uk) — free "Small Business Guide" and incident response templates aimed at exactly your size of org.
+- **ICO** (ico.org.uk) — personal data breach guidance and what/when to report.
+- This one you can largely write yourself; it's a short process doc, not a legal contract.
 
 **Why:** GDPR requires you to report breaches within 72 hours. Having a plan means you don't panic and miss the deadline. Also reassures clients during due diligence.
 

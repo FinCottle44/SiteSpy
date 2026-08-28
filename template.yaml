@@ -120,6 +120,25 @@ Resources:
             Prefix: timelapse/
             Status: Enabled
             ExpirationInDays: 30
+          # Out-of-hours snapshots under security/ expire after 7 days. Promoted
+          # snapshots are relocated to preserved/ (not matched here), so they are
+          # covered only by TransitionToGlacierAfter1Year with no expiry.
+          - Id: ExpireOutOfHoursSnapshots
+            Prefix: security/
+            Status: Enabled
+            ExpirationInDays: 7
+          # The bucket is versioned, so an ExpirationInDays rule only writes a
+          # delete marker and keeps the object bytes as a noncurrent version.
+          # These two bucket-wide rules actually reclaim that storage: expire
+          # noncurrent versions 1 day after they become noncurrent, and clean
+          # up the delete markers left behind once no versions remain.
+          - Id: ExpireNoncurrentVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 1
+          - Id: RemoveExpiredDeleteMarkers
+            Status: Enabled
+            ExpiredObjectDeleteMarker: true
       CorsConfiguration:
         CorsRules:
           - AllowedOrigins: ["*"]
@@ -364,6 +383,78 @@ Resources:
           Properties:
             RestApiId: !Ref SiteSpyApi
             Path: /v1/snapshots
+            Method: GET
+
+  # ── Snapshots Out-of-Hours Review Lambda ──────────────────────────────────
+  SnapshotsOutOfHoursFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub sitespy-${Environment}-snapshots-out-of-hours
+      CodeUri: src/
+      Handler: sitespy.handlers.snapshots_out_of_hours.handler_list
+      Description: Lists out-of-hours snapshots for a camera within a date range.
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref DataTable
+        - Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub "arn:aws:s3:::${SnapshotsBucket}/*"
+      Events:
+        GetSnapshotsOutOfHours:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SiteSpyApi
+            Path: /v1/snapshots/out-of-hours
+            Method: GET
+
+  # ── Snapshots Out-of-Hours Promote Lambda ─────────────────────────────────
+  SnapshotsPromoteFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub sitespy-${Environment}-snapshots-promote
+      CodeUri: src/
+      Handler: sitespy.handlers.snapshots_out_of_hours.handler_promote
+      Description: Promotes an out-of-hours snapshot to preserve it beyond the 7-day expiry.
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DataTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+                - s3:DeleteObject
+              Resource: !Sub "arn:aws:s3:::${SnapshotsBucket}/*"
+      Events:
+        PostSnapshotsPromote:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SiteSpyApi
+            Path: /v1/snapshots/out-of-hours/promote
+            Method: POST
+
+  # ── Snapshots Out-of-Hours Download Lambda ────────────────────────────────
+  SnapshotsDownloadFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub sitespy-${Environment}-snapshots-download
+      CodeUri: src/
+      Handler: sitespy.handlers.snapshots_out_of_hours.handler_download
+      Description: Returns a 15-minute presigned URL to download a preserved out-of-hours snapshot.
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref DataTable
+        - Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub "arn:aws:s3:::${SnapshotsBucket}/*"
+      Events:
+        GetSnapshotsDownload:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SiteSpyApi
+            Path: /v1/snapshots/out-of-hours/download
             Method: GET
 
   # ── Flags POST Lambda ─────────────────────────────────────────────────────

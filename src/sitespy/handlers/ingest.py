@@ -18,7 +18,7 @@ from typing import Any
 from aws_lambda_powertools import Logger, Metrics
 from aws_lambda_powertools.metrics import MetricUnit
 
-from sitespy import data, storage
+from sitespy import data, retention, storage
 from sitespy.errors import ApiError, BadRequest, InternalError, Unauthorized
 from sitespy.http import error_response, json_response, unhandled_error_response
 from sitespy.weather import fetch_current_weather, weather_to_dynamo_map
@@ -40,6 +40,10 @@ _MAX_BODY_BYTES = 10 * 1024 * 1024  # 10 MiB
 _JPEG_MAGIC = b"\xff\xd8\xff"
 _ROUTE = "POST /v1/ingest/{token}"
 _CADENCE_MINUTES = 15
+# Fixed out-of-hours retention: 7 days (not tenant-configurable in v1, Req 7.3).
+_OUT_OF_HOURS_TTL_SECONDS = 604800
+# Capture timestamps are UTC ISO-8601 with a literal Z suffix, second precision.
+_CAPTURE_TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
 
 # ---------------------------------------------------------------------------
@@ -183,36 +187,15 @@ def _handle(event: dict[str, Any], correlation_id: str) -> dict[str, Any]:
     if not body.startswith(_JPEG_MAGIC):
         raise BadRequest("Request body must be a valid JPEG (magic bytes FF D8 FF).")
 
-    # --- Check ingest hours ---
-    # If the site has ingest_hours configured, check whether the current time
-    # (in the site's timezone) falls within the allowed window. If not, accept
-    # the request (200) but skip saving the image.
-    if _is_outside_ingest_hours(tenant_id, site_id):
-        logger.info(
-            "ingest_skipped_outside_hours",
-            extra={
-                "tenant_id": tenant_id,
-                "site_id": site_id,
-                "camera_id": camera_id,
-                "correlation_id": correlation_id,
-            },
-        )
-        return json_response(
-            200,
-            {
-                "status": "skipped",
-                "reason": "outside_ingest_hours",
-                "camera_id": camera_id,
-            },
-            correlation_id,
-        )
-
     # --- Cadence check ---
-    # Enforce a minimum 15-minute gap between saved timelapse snapshots.
-    # Fail open: if DynamoDB read errors, treat as no prior record.
+    # Enforce a minimum 15-minute gap between saved timelapse snapshots. The
+    # cadence baseline is the most recent saved snapshot across BOTH retention
+    # classes (IMG# and OOH_IMG#) so the 15-minute gap is enforced irrespective
+    # of retention class (Req 4.2). Fail open: if DynamoDB read errors, treat as
+    # no prior record.
     save_timelapse = True
     try:
-        latest_img = data.get_latest_img_record(tenant_id, site_id, camera_id)
+        latest_img = data.get_latest_any_img_record(tenant_id, site_id, camera_id)
         if latest_img is not None:
             ingested_at_str = latest_img.get("ingested_at", {}).get("S", "")
             if ingested_at_str:
@@ -284,29 +267,24 @@ def _handle(event: dict[str, Any], correlation_id: str) -> dict[str, Any]:
         )
 
     # --- Hash and timestamp ---
+    # Resolve a single capture instant reused for the SK, the S3 key date
+    # segments, ingested_at, and (for out-of-hours) the TTL base — guaranteeing
+    # the DynamoDB TTL and the S3 object are derived from the same instant
+    # (Req 7.5, 11.7).
     snapshot_ts = datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     sha256_hex = hashlib.sha256(body).hexdigest()
 
-    # --- Timelapse write (existing code path) ---
+    # --- Timelapse write (24/7 with retention classification) ---
     key = ""
+    retention_class_value = ""
     if save_timelapse:
-        key = storage.build_snapshot_key(tenant_id, site_id, camera_id, snapshot_ts)
-        retention_years = data.get_retention_years(tenant_id)
-
-        # --- Fetch weather for timelapse snapshots only (fail open) ---
-        weather_map = None
+        # Fetch the site once for timezone, working_hours, and lat/lon.
+        site_item: dict[str, Any] | None = None
         try:
             site_item = data.get_site(tenant_id, site_id)
-            if site_item:
-                lat_val = site_item.get("latitude", {}).get("N")
-                lon_val = site_item.get("longitude", {}).get("N")
-                if lat_val and lon_val:
-                    weather = fetch_current_weather(float(lat_val), float(lon_val))
-                    if weather:
-                        weather_map = weather_to_dynamo_map(weather)
         except Exception:
             logger.warning(
-                "weather_fetch_failed",
+                "site_fetch_failed",
                 extra={
                     "tenant_id": tenant_id,
                     "site_id": site_id,
@@ -315,26 +293,120 @@ def _handle(event: dict[str, Any], correlation_id: str) -> dict[str, Any]:
                 },
             )
 
-        try:
-            storage.put_snapshot(key, body, sha256_hex, snapshot_ts, tenant_id, retention_years)
-        except Exception as exc:
-            logger.exception("s3_put_snapshot_failed")
-            raise InternalError("An internal error occurred.") from exc
+        site_timezone = None
+        if site_item is not None:
+            site_timezone = site_item.get("timezone", {}).get("S")
 
-        try:
-            data.put_img_record(
-                tenant_id=tenant_id,
-                site_id=site_id,
-                camera_id=camera_id,
-                snapshot_ts=snapshot_ts,
-                s3_key=key,
-                sha256_hex=sha256_hex,
-                size_bytes=len(body),
-                weather=weather_map,
+        working_hours = (
+            retention.resolve_working_hours(site_item)
+            if site_item is not None
+            else None
+        )
+        retention_class, error_reason = retention.classify(
+            working_hours, snapshot_ts, site_timezone
+        )
+        if error_reason == "invalid_timezone":
+            # Fail-safe: an unrecognised/missing timezone classifies as
+            # Out_Of_Hours (Req 3.10). Log the classifier reason.
+            logger.warning(
+                "retention_invalid_timezone",
+                extra={
+                    "tenant_id": tenant_id,
+                    "site_id": site_id,
+                    "camera_id": camera_id,
+                    "correlation_id": correlation_id,
+                    "reason": error_reason,
+                },
             )
-        except Exception as exc:
-            logger.exception("dynamodb_put_img_record_failed")
-            raise InternalError("An internal error occurred.") from exc
+        retention_class_value = retention_class.value
+
+        if retention_class is retention.RetentionClass.IN_HOURS:
+            key = storage.build_snapshot_key(
+                tenant_id, site_id, camera_id, snapshot_ts
+            )
+            retention_years = data.get_retention_years(tenant_id)
+
+            # --- Fetch weather for In_Hours snapshots when lat/lon present ---
+            weather_map = None
+            try:
+                if site_item:
+                    lat_val = site_item.get("latitude", {}).get("N")
+                    lon_val = site_item.get("longitude", {}).get("N")
+                    if lat_val and lon_val:
+                        weather = fetch_current_weather(
+                            float(lat_val), float(lon_val)
+                        )
+                        if weather:
+                            weather_map = weather_to_dynamo_map(weather)
+            except Exception:
+                logger.warning(
+                    "weather_fetch_failed",
+                    extra={
+                        "tenant_id": tenant_id,
+                        "site_id": site_id,
+                        "camera_id": camera_id,
+                        "correlation_id": correlation_id,
+                    },
+                )
+
+            try:
+                storage.put_snapshot(
+                    key, body, sha256_hex, snapshot_ts, tenant_id, retention_years
+                )
+            except Exception as exc:
+                logger.exception("s3_put_snapshot_failed")
+                raise InternalError("An internal error occurred.") from exc
+
+            try:
+                data.put_img_record(
+                    tenant_id=tenant_id,
+                    site_id=site_id,
+                    camera_id=camera_id,
+                    snapshot_ts=snapshot_ts,
+                    s3_key=key,
+                    sha256_hex=sha256_hex,
+                    size_bytes=len(body),
+                    weather=weather_map,
+                    retention_class=retention.RetentionClass.IN_HOURS.value,
+                )
+            except Exception as exc:
+                logger.exception("dynamodb_put_img_record_failed")
+                raise InternalError("An internal error occurred.") from exc
+
+        else:
+            # --- Out_Of_Hours write path (security/ prefix + 7-day TTL) ---
+            # Reject the write if a valid capture time cannot be formed (Req 7.2).
+            capture_epoch = _capture_epoch_seconds(snapshot_ts)
+            if capture_epoch is None:
+                raise BadRequest("Capture time is missing or invalid.")
+
+            ttl = capture_epoch + _OUT_OF_HOURS_TTL_SECONDS
+            key = storage.build_out_of_hours_key(
+                tenant_id, site_id, camera_id, snapshot_ts
+            )
+
+            try:
+                storage.put_out_of_hours_snapshot(
+                    key, body, sha256_hex, snapshot_ts, tenant_id
+                )
+            except Exception as exc:
+                logger.exception("s3_put_out_of_hours_snapshot_failed")
+                raise InternalError("An internal error occurred.") from exc
+
+            try:
+                data.put_out_of_hours_img_record(
+                    tenant_id=tenant_id,
+                    site_id=site_id,
+                    camera_id=camera_id,
+                    snapshot_ts=snapshot_ts,
+                    s3_key=key,
+                    sha256_hex=sha256_hex,
+                    size_bytes=len(body),
+                    ttl=ttl,
+                )
+            except Exception as exc:
+                logger.exception("dynamodb_put_out_of_hours_img_record_failed")
+                raise InternalError("An internal error occurred.") from exc
 
     # --- Live write ---
     live_captured = False
@@ -377,6 +449,7 @@ def _handle(event: dict[str, Any], correlation_id: str) -> dict[str, Any]:
                 "camera_id": camera_id,
                 "sha256": sha256_hex,
                 "size_bytes": len(body),
+                "retention_class": retention_class_value,
                 "live_captured": live_captured,
             },
             correlation_id,
@@ -409,71 +482,20 @@ def resolve_correlation_id(event: dict[str, Any]) -> str:
     return str(uuid.uuid4())
 
 
-def _is_outside_ingest_hours(tenant_id: str, site_id: str) -> bool:
-    """Check if the current time is outside the site's configured ingest hours.
+def _capture_epoch_seconds(snapshot_ts: str) -> int | None:
+    """Return the Unix epoch seconds for a capture timestamp, or None if invalid.
 
-    Returns False (allow ingest) if:
-    - No ingest_hours are configured on the site
-    - The site doesn't exist (shouldn't happen at this point)
-    - The current time in the site's timezone is within the configured window
-
-    Returns True (skip ingest) if the current time is outside the window.
-
-    Supports overnight windows (e.g. start=22:00, end=06:00).
+    Validates the ``YYYY-MM-DDTHH:MM:SSZ`` shape before computing the epoch so a
+    malformed capture time is rejected rather than producing an out-of-hours TTL
+    from an unparseable value (Req 7.2).
     """
-    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-
+    if not _CAPTURE_TS_RE.match(snapshot_ts):
+        return None
     try:
-        ingest_hours = data.get_site_ingest_hours(tenant_id, site_id)
-    except Exception:
-        logger.exception("failed_to_fetch_ingest_hours")
-        # On failure, allow ingest (fail open)
-        return False
-
-    if ingest_hours is None:
-        return False
-
-    start_str = ingest_hours.get("start", "")
-    end_str = ingest_hours.get("end", "")
-
-    if not start_str or not end_str:
-        return False
-
-    # Get the site's timezone
-    try:
-        site_item = data.get_site(tenant_id, site_id)
-    except Exception:
-        logger.exception("failed_to_fetch_site_for_timezone")
-        return False
-
-    if site_item is None:
-        return False
-
-    tz_str = site_item.get("timezone", {}).get("S", "UTC")
-    try:
-        site_tz = ZoneInfo(tz_str)
-    except (ZoneInfoNotFoundError, KeyError, ValueError):
-        site_tz = ZoneInfo("UTC")
-
-    # Get current time in site's timezone
-    now_local = datetime.now(tz=UTC).astimezone(site_tz)
-    current_minutes = now_local.hour * 60 + now_local.minute
-
-    # Parse start/end into minutes since midnight
-    start_parts = start_str.split(":")
-    end_parts = end_str.split(":")
-    start_minutes = int(start_parts[0]) * 60 + int(start_parts[1])
-    end_minutes = int(end_parts[0]) * 60 + int(end_parts[1])
-
-    # Check if current time is within the window
-    if start_minutes < end_minutes:
-        # Normal window (e.g. 07:00 to 18:00)
-        is_within = start_minutes <= current_minutes < end_minutes
-    else:
-        # Overnight window (e.g. 22:00 to 06:00)
-        is_within = current_minutes >= start_minutes or current_minutes < end_minutes
-
-    return not is_within
+        parsed = datetime.fromisoformat(snapshot_ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return int(parsed.timestamp())
 
 
 def _decode_body(event: dict[str, Any]) -> bytes:

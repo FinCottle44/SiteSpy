@@ -280,3 +280,190 @@ def put_timelapse_artifact(key: str, body: bytes) -> None:
         Body=body,
         ContentType="video/mp4",
     )
+
+
+def build_out_of_hours_key(
+    tenant_id: str,
+    site_id: str,
+    camera_id: str,
+    snapshot_ts: str,
+) -> str:
+    """Build the canonical S3 key for an out-of-hours snapshot.
+
+    Key format: security/<tenant_id>/<site_id>/<camera_id>/<YYYY>/<MM>/<DD>/<snapshot_ts>.jpg
+
+    Out-of-hours snapshots live under a distinct ``security/`` prefix that shares
+    no common path segment with the in-hours long-term key, the ``live/`` key, or
+    the ``timelapse/`` key (Requirement 5.5). The ``<YYYY>/<MM>/<DD>`` date
+    segments are retained (unlike ``live/``) so review can be served efficiently
+    and keys remain human-diagnosable. Date components are parsed from
+    snapshot_ts itself (format YYYY-MM-DDTHH:mm:ssZ) so there is a single source
+    of truth for the date segments.
+
+    Args:
+        tenant_id:   Tenant identifier.
+        site_id:     Site identifier.
+        camera_id:   Camera identifier.
+        snapshot_ts: UTC timestamp in YYYY-MM-DDTHH:mm:ssZ format.
+
+    Returns:
+        The canonical S3 object key string for the out-of-hours snapshot.
+    """
+    date_part = snapshot_ts[:10]  # "2025-06-15"
+    yyyy, mm, dd = date_part.split("-")
+    return f"security/{tenant_id}/{site_id}/{camera_id}/{yyyy}/{mm}/{dd}/{snapshot_ts}.jpg"
+
+
+def build_preserved_key(
+    tenant_id: str,
+    site_id: str,
+    camera_id: str,
+    snapshot_ts: str,
+) -> str:
+    """Build the canonical S3 key for a promoted (preserved) out-of-hours snapshot.
+
+    Key format: preserved/<tenant_id>/<site_id>/<camera_id>/<YYYY>/<MM>/<DD>/<snapshot_ts>.jpg
+
+    The ``preserved/`` prefix is not covered by the ``security/`` 7-day lifecycle
+    expiry rule, so a promoted object survives past the out-of-hours TTL and
+    remains downloadable (Requirements 9.3, 10.1). Date components are parsed from
+    snapshot_ts itself (format YYYY-MM-DDTHH:mm:ssZ) so there is a single source
+    of truth for the date segments.
+
+    Args:
+        tenant_id:   Tenant identifier.
+        site_id:     Site identifier.
+        camera_id:   Camera identifier.
+        snapshot_ts: UTC timestamp in YYYY-MM-DDTHH:mm:ssZ format.
+
+    Returns:
+        The canonical S3 object key string for the preserved snapshot.
+    """
+    date_part = snapshot_ts[:10]  # "2025-06-15"
+    yyyy, mm, dd = date_part.split("-")
+    return f"preserved/{tenant_id}/{site_id}/{camera_id}/{yyyy}/{mm}/{dd}/{snapshot_ts}.jpg"
+
+
+def put_out_of_hours_snapshot(
+    key: str,
+    body: bytes,
+    sha256_hex: str,
+    snapshot_ts: str,
+    tenant_id: str,
+) -> None:
+    """Write an out-of-hours JPEG snapshot to S3 with integrity metadata.
+
+    No retention tag is applied — cleanup is handled exclusively by the S3
+    Lifecycle rule that expires objects under the ``security/`` prefix after
+    7 days, mirroring the ``live/`` snapshot pattern (Requirements 5.5, 7.4).
+
+    Args:
+        key:         Canonical S3 object key (from build_out_of_hours_key).
+        body:        Raw JPEG bytes.
+        sha256_hex:  Lowercase hex SHA-256 digest of body.
+        snapshot_ts: UTC timestamp (YYYY-MM-DDTHH:mm:ssZ).
+        tenant_id:   Tenant identifier (stored in object metadata for traceability).
+    """
+    _s3_client().put_object(
+        Bucket=get_settings().snapshots_bucket,
+        Key=key,
+        Body=body,
+        ContentType="image/jpeg",
+        Metadata={
+            "sha256": sha256_hex,
+            "captured-at": snapshot_ts,
+            "tenant-id": tenant_id,
+        },
+    )
+
+
+def promote_object(source_key: str, dest_key: str) -> None:
+    """Relocate an S3 object from ``source_key`` to ``dest_key``.
+
+    Copies the source object to the destination then deletes the source. The
+    copy is naturally idempotent for the same destination, so this is safe to
+    re-run when recovering from a partially-completed promotion (Requirement 9.3).
+
+    Args:
+        source_key: Canonical S3 object key to relocate from (e.g. security/...).
+        dest_key:   Canonical S3 object key to relocate to (e.g. preserved/...).
+    """
+    bucket = get_settings().snapshots_bucket
+    _s3_client().copy_object(
+        Bucket=bucket,
+        Key=dest_key,
+        CopySource={"Bucket": bucket, "Key": source_key},
+    )
+    _s3_client().delete_object(
+        Bucket=bucket,
+        Key=source_key,
+    )
+
+
+def copy_object(source_key: str, dest_key: str) -> None:
+    """Copy an S3 object from ``source_key`` to ``dest_key`` without deleting the source.
+
+    This is the first step of the promotion sequence (copy → commit → delete):
+    the source object is intentionally left in place so that, if the subsequent
+    DynamoDB commit fails, the copied destination can be rolled back and the
+    original object remains under its original expiry (Requirement 9.7). The copy
+    is naturally idempotent for the same destination, so it is safe to re-run.
+
+    Args:
+        source_key: Canonical S3 object key to copy from (e.g. security/...).
+        dest_key:   Canonical S3 object key to copy to (e.g. preserved/...).
+    """
+    bucket = get_settings().snapshots_bucket
+    _s3_client().copy_object(
+        Bucket=bucket,
+        Key=dest_key,
+        CopySource={"Bucket": bucket, "Key": source_key},
+    )
+
+
+def delete_object(key: str) -> None:
+    """Delete a single object from the snapshots bucket.
+
+    Used by the promotion flow both to roll back a copied ``preserved/`` object
+    when the DynamoDB commit fails (Requirement 9.7) and to remove the original
+    ``security/`` object after a successful commit (best-effort cleanup).
+
+    Args:
+        key: Canonical S3 object key to delete.
+    """
+    _s3_client().delete_object(
+        Bucket=get_settings().snapshots_bucket,
+        Key=key,
+    )
+
+
+def object_exists(key: str) -> bool:
+    """Return True if the object exists in the snapshots bucket, else False.
+
+    Issues a ``HeadObject`` against the snapshots bucket. A response indicating
+    the object is absent — ``404`` / ``NoSuchKey`` / a 403 raised when the object
+    does not exist (HeadObject on a missing key without ``s3:ListBucket``) — is
+    treated as "does not exist" and returns ``False``. Any other error propagates
+    so the calling handler can surface a 500. Mirrors ``timelapse_artifact_exists``.
+
+    Used by the out-of-hours download handler to confirm an object is present
+    before minting a presigned URL, so an expired object never yields a broken
+    link (Requirement 10.1, 10.2).
+
+    Args:
+        key: Canonical S3 object key.
+
+    Returns:
+        True if the object exists, False if it is absent.
+    """
+    try:
+        _s3_client().head_object(
+            Bucket=get_settings().snapshots_bucket,
+            Key=key,
+        )
+    except ClientError as exc:
+        error_code = exc.response.get("Error", {}).get("Code", "")
+        if error_code in ("404", "NoSuchKey", "NotFound", "403", "Forbidden"):
+            return False
+        raise
+    return True
